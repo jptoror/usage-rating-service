@@ -1,0 +1,57 @@
+# Documentation
+
+| Document | What it covers |
+| --- | --- |
+| [Architecture](diagrams/architecture.md) | System context, module dependencies, data model, database-enforced invariants, deployment |
+| [Sequence diagrams](diagrams/sequences.md) | One per operation, with transaction boundaries marked |
+| [Manual testing](manual-testing.md) | Walking through the service by hand, and what each scenario proves |
+| [Complexity analysis](analysis/complexity.md) | Big-O per operation, where the limits are, what would break first |
+| [Evidence](evidence/) | Transcripts from actual runs — requests, responses, and per-instance breakdowns |
+
+The [README](../README.md) at the repository root covers build, run, configuration and
+the design decisions themselves.
+
+---
+
+## Scripts
+
+All under `scripts/`. Each asserts and exits non-zero on failure, so they work in CI as
+well as by hand.
+
+| Script | Purpose |
+| --- | --- |
+| `start.sh [--scale N]` | Start the service; `--scale 3` runs three instances behind nginx |
+| `stop.sh [--clean]` | Stop; `--clean` also deletes the database volume |
+| `e2e-test.sh [--evidence]` | 22 checks across all eight functional requirements |
+| `edge-case-test.sh [--evidence]` | Boundaries through the full stack — precision, validation, isolation |
+| `multi-instance-test.sh [--evidence]` | Coordination across separate processes under real contention |
+
+`--evidence` writes a timestamped transcript to `evidence/`.
+
+```bash
+./scripts/start.sh --scale 3
+./scripts/e2e-test.sh --evidence
+./scripts/edge-case-test.sh --evidence
+./scripts/multi-instance-test.sh --evidence
+./scripts/stop.sh --clean
+```
+
+---
+
+## Why the scripts exist alongside the test suite
+
+The automated suite (309 tests, 92% line coverage) runs against Testcontainers and
+covers the domain thoroughly. The scripts cover what it structurally cannot:
+
+- **The wire.** A scale lost in JSON, a timezone applied by a driver, a numeric column
+  truncating. A seeded price changeover was five hours off in exactly this way, and no
+  unit test could have seen it.
+- **Separate processes.** The suite proves concurrency between threads sharing one
+  connection pool. Three containers with three pools and three schedulers is a different
+  claim, and it is the one the brief asks about.
+- **The assembled application.** A Kotlin constructor default that breaks Spring bean
+  creation compiles, unit-tests green, and fails only when the container starts. That
+  happened; `ApplicationContextIntegrationTest` now catches it.
+
+Three defects reached the finished service and were found only by running it — all
+listed in the root README under "Notes from building this."

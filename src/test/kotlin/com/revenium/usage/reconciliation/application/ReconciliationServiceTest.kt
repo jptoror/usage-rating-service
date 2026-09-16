@@ -191,6 +191,6 @@ class ReconciliationServiceTest {
 
     @Test
     fun `refuses to list lines with no tenant in scope`() {
-        assertFailsWith<MissingTenantException> { service.lines(customer, august) }
+        assertFailsWith<MissingTenantException> { service.lines(customer, august, null) }
     }
 }

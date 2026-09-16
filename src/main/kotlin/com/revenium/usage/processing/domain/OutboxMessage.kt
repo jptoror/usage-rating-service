@@ -82,6 +82,16 @@ class OutboxMessage(
     @Column(name = "last_error")
     var lastError: String? = null,
 
+    /**
+     * The instance that last claimed this message.
+     *
+     * Evidence only -- nothing reads it to make a decision. It exists so a
+     * multi-instance run can be shown to have split work across instances rather
+     * than concentrating it in one.
+     */
+    @Column(name = "processed_by")
+    var processedBy: String? = null,
+
     @Column(name = "created_at", nullable = false, updatable = false)
     val createdAt: Instant = Instant.now(),
 

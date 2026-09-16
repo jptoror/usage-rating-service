@@ -1,5 +1,6 @@
 package com.revenium.usage.processing.application
 
+import com.revenium.usage.processing.domain.InstanceId
 import com.revenium.usage.processing.domain.OutboxMessage
 import com.revenium.usage.processing.infrastructure.ClaimedWork
 import com.revenium.usage.processing.infrastructure.OutboxClaimRepository
@@ -66,11 +67,14 @@ data class OutboxProperties(
 @Component
 class OutboxWorker(
     private val claims: OutboxClaimRepository,
-    private val messages: OutboxMessageRepository,
     private val ratingService: RatingService,
     private val status: OutboxStatusRecorder,
     private val properties: OutboxProperties,
     private val clock: Clock,
+    // Injected rather than defaulted: a default value on a constructor Spring wires
+    // makes Kotlin emit a synthetic DefaultConstructorMarker parameter, which Spring
+    // then tries to resolve as a bean and fails at startup.
+    private val instanceId: InstanceId,
 ) {
 
     /**
@@ -81,7 +85,7 @@ class OutboxWorker(
         val now = clock.instant()
         claims.reclaimStale(now, properties.staleClaimTimeout)
 
-        val batch = claims.claimBatch(now, properties.batchSize)
+        val batch = claims.claimBatch(now, properties.batchSize, instanceId.value)
         if (batch.isEmpty()) return 0
 
         log.debug { "Claimed ${batch.size} outbox messages" }

@@ -3,6 +3,7 @@ package com.revenium.usage.shared.config
 import com.revenium.usage.pricing.domain.PricingRuleLookup
 import com.revenium.usage.processing.application.OutboxProperties
 import com.revenium.usage.rating.domain.RatingCalculator
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.context.properties.ConfigurationProperties
 import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Bean
@@ -54,4 +55,16 @@ class RatingConfiguration {
     @Bean
     fun defaultCurrency(billing: BillingProperties): java.util.Currency =
         java.util.Currency.getInstance(billing.defaultCurrency)
+
+    /**
+     * Identifies this instance in the evidence a multi-instance run produces.
+     *
+     * Defaults to the container hostname, which Compose makes unique per replica.
+     * `INSTANCE_ID` overrides it where a more readable name helps.
+     */
+    @Bean
+    fun instanceId(
+        @Value("\${INSTANCE_ID:}") override: String,
+    ): com.revenium.usage.processing.domain.InstanceId =
+        com.revenium.usage.processing.domain.InstanceId.detect(override.ifBlank { null })
 }

@@ -15,7 +15,10 @@ import kotlin.test.assertTrue
 class TransactionValidatorTest {
 
     private val now = Instant.parse("2026-09-16T12:00:00Z")
-    private val validator = TransactionValidator(Clock.fixed(now, ZoneOffset.UTC))
+    // The skew is supplied explicitly now that the class carries no default: the
+    // configuration lives in IngestionProperties, not in the domain class.
+    private val defaultSkew: Duration = Duration.ofMinutes(5)
+    private val validator = TransactionValidator(Clock.fixed(now, ZoneOffset.UTC), defaultSkew)
     private val tenant = TenantId("tenant-a")
 
     private fun input(
@@ -143,7 +146,7 @@ class TransactionValidatorTest {
     @Test
     fun `tolerates small clock skew into the future`() {
         // Boundary: exactly at the skew limit is still accepted.
-        val atLimit = now.plus(TransactionValidator.DEFAULT_MAX_FUTURE_SKEW)
+        val atLimit = now.plus(defaultSkew)
         assertIs<ValidationOutcome.Valid>(validator.validate(input(occurredAt = atLimit.toString()), tenant))
     }
 
@@ -151,7 +154,7 @@ class TransactionValidatorTest {
     fun `rejects an occurredAt beyond the skew tolerance`() {
         // A future timestamp would select a rule that is not in effect and land in a
         // period that has not started.
-        val beyondLimit = now.plus(TransactionValidator.DEFAULT_MAX_FUTURE_SKEW).plusSeconds(1)
+        val beyondLimit = now.plus(defaultSkew).plusSeconds(1)
         val failures = failuresOf(validator.validate(input(occurredAt = beyondLimit.toString()), tenant))
         assertTrue(failures.single().reason.contains("future"))
     }

@@ -5,7 +5,6 @@ import com.revenium.usage.shared.domain.EventId
 import com.revenium.usage.shared.domain.Quantity
 import com.revenium.usage.shared.domain.TransactionCode
 import com.revenium.usage.tenancy.TenantId
-import org.springframework.stereotype.Component
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Duration
@@ -39,11 +38,16 @@ data class RawTransactionInput(
  * Collects **all** failures rather than stopping at the first. An integration fixing one
  * field at a time across successive deployments is a bad experience; one response listing
  * everything wrong is a good one.
+ *
+ * Constructed by `IngestionConfiguration` rather than component-scanned: a default value
+ * on the constructor of a scanned bean makes Kotlin emit a synthetic
+ * `DefaultConstructorMarker` parameter that Spring tries to autowire, which is the same
+ * failure that once stopped this application from starting. Wiring it explicitly also
+ * keeps the class free of Spring annotations, so it unit-tests with no context at all.
  */
-@Component
 class TransactionValidator(
     private val clock: Clock,
-    private val maxFutureSkew: Duration = DEFAULT_MAX_FUTURE_SKEW,
+    private val maxFutureSkew: Duration,
 ) {
 
     fun validate(input: RawTransactionInput, contextTenant: TenantId): ValidationOutcome {
@@ -142,11 +146,6 @@ class TransactionValidator(
 
     private fun parseInstant(raw: String?): Instant? =
         raw?.trim()?.takeIf { it.isNotEmpty() }?.let { runCatching { Instant.parse(it) }.getOrNull() }
-
-    companion object {
-        /** Tolerates ordinary clock skew between the sender and this service. */
-        val DEFAULT_MAX_FUTURE_SKEW: Duration = Duration.ofMinutes(5)
-    }
 }
 
 /** Validation either yields a usable transaction or the reasons it does not. */

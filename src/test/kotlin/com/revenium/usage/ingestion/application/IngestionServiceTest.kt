@@ -59,7 +59,7 @@ class IngestionServiceTest {
     private val objectMapper = ObjectMapper()
 
     private val service = IngestionService(
-        validator = TransactionValidator(clock),
+        validator = TransactionValidator(clock, java.time.Duration.ofMinutes(5)),
         eventRecorder = EventRecorder(rawEvents, outbox, clock),
         duplicateResolver = DuplicateResolver(rawEvents, conflicts, clock),
         rejectionRecorder = RejectionRecorder(rejectedEvents, objectMapper, clock),
