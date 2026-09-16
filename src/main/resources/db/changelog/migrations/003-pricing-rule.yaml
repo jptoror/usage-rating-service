@@ -1,0 +1,74 @@
+databaseChangeLog:
+
+  # ---------------------------------------------------------------------------
+  # pricing_rule -- effective-dated unit price per (tenant, transaction_code).
+  #
+  # Validity is [effective_from, effective_to): start inclusive, end exclusive.
+  # The half-open interval removes the ambiguity at the changeover instant, which
+  # is exactly where off-by-one-cent bugs live.
+  #
+  # Rules are never edited or deleted. Changing a price means closing the current
+  # rule and inserting a new one, so a rated amount stays explainable forever.
+  # ---------------------------------------------------------------------------
+  - changeSet:
+      id: 003-01-pricing-rule
+      author: jptoro
+      changes:
+        - createTable:
+            tableName: pricing_rule
+            columns:
+              - column: { name: id, type: BIGINT, autoIncrement: true, constraints: { primaryKey: true, primaryKeyName: pk_pricing_rule } }
+              - column: { name: tenant_id, type: TEXT, constraints: { nullable: false } }
+              - column: { name: transaction_code, type: TEXT, constraints: { nullable: false } }
+              # Scale 6: unit prices are never rounded, only amounts are.
+              - column: { name: unit_price, type: "NUMERIC(19,6)", constraints: { nullable: false } }
+              - column: { name: currency, type: "CHAR(3)", constraints: { nullable: false } }
+              - column: { name: effective_from, type: TIMESTAMPTZ, constraints: { nullable: false } }
+              # NULL means "in effect indefinitely".
+              - column: { name: effective_to, type: TIMESTAMPTZ }
+              - column: { name: created_at, type: TIMESTAMPTZ, defaultValueComputed: now(), constraints: { nullable: false } }
+              - column: { name: description, type: TEXT }
+
+        - sql:
+            sql: ALTER TABLE pricing_rule ADD CONSTRAINT ck_pricing_rule_price_non_negative CHECK (unit_price >= 0)
+        - sql:
+            sql: >
+              ALTER TABLE pricing_rule ADD CONSTRAINT ck_pricing_rule_period_ordered
+              CHECK (effective_to IS NULL OR effective_to > effective_from)
+        - sql:
+            sql: ALTER TABLE pricing_rule ADD CONSTRAINT ck_pricing_rule_currency_iso CHECK (currency ~ '^[A-Z]{3}$')
+
+  - changeSet:
+      id: 003-02-pricing-rule-no-overlap
+      author: jptoro
+      comment: >
+        The load-bearing constraint of the whole rating design. Postgres physically
+        prevents two rules from covering the same instant for the same tenant and
+        transaction code, so rule resolution returns at most one row and rating is
+        deterministic. An application-level check would race under concurrent rule
+        creation; this does not.
+      changes:
+        - sql:
+            sql: >
+              ALTER TABLE pricing_rule ADD CONSTRAINT ex_pricing_rule_no_overlap
+              EXCLUDE USING gist (
+                tenant_id WITH =,
+                transaction_code WITH =,
+                tstzrange(effective_from, effective_to, '[)') WITH &&
+              )
+            rollback: ALTER TABLE pricing_rule DROP CONSTRAINT ex_pricing_rule_no_overlap
+
+  - changeSet:
+      id: 003-03-pricing-rule-lookup-index
+      author: jptoro
+      changes:
+        # The hot path: resolve the rule in effect at occurredAt.
+        - createIndex:
+            tableName: pricing_rule
+            indexName: ix_pricing_rule_lookup
+            columns:
+              - column: { name: tenant_id }
+              - column: { name: transaction_code }
+              - column: { name: effective_from }
+      rollback:
+        - dropIndex: { tableName: pricing_rule, indexName: ix_pricing_rule_lookup }

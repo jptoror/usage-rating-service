@@ -1,0 +1,111 @@
+databaseChangeLog:
+
+  # ---------------------------------------------------------------------------
+  # invoice -- materialised when a period closes.
+  #
+  # While a period is OPEN the summary is computed on read from
+  # rated_transaction, so it always reflects the latest rating without any
+  # recomputation step. Closing freezes the totals into these tables, and a
+  # closed invoice is never modified again -- late events become adjustments in
+  # the next open period instead.
+  # ---------------------------------------------------------------------------
+  - changeSet:
+      id: 006-01-invoice
+      author: jptoro
+      changes:
+        - createTable:
+            tableName: invoice
+            columns:
+              - column: { name: id, type: BIGINT, autoIncrement: true, constraints: { primaryKey: true, primaryKeyName: pk_invoice } }
+              - column: { name: tenant_id, type: TEXT, constraints: { nullable: false } }
+              - column: { name: customer_id, type: TEXT, constraints: { nullable: false } }
+              # First day of the billing month, UTC.
+              - column: { name: period_start, type: DATE, constraints: { nullable: false } }
+              # Exclusive upper bound, mirroring pricing rule validity.
+              - column: { name: period_end, type: DATE, constraints: { nullable: false } }
+              - column: { name: status, type: TEXT, defaultValue: OPEN, constraints: { nullable: false } }
+              - column: { name: currency, type: "CHAR(3)", constraints: { nullable: false } }
+
+              # Consumption that belongs to this period.
+              - column: { name: current_period_amount, type: "NUMERIC(19,4)", defaultValueNumeric: 0, constraints: { nullable: false } }
+              # Late arrivals from earlier, closed periods, billed here.
+              - column: { name: adjustment_amount, type: "NUMERIC(19,4)", defaultValueNumeric: 0, constraints: { nullable: false } }
+              - column: { name: total_amount, type: "NUMERIC(19,4)", defaultValueNumeric: 0, constraints: { nullable: false } }
+              - column: { name: transaction_count, type: BIGINT, defaultValueNumeric: 0, constraints: { nullable: false } }
+
+              - column: { name: closed_at, type: TIMESTAMPTZ }
+              - column: { name: created_at, type: TIMESTAMPTZ, defaultValueComputed: now(), constraints: { nullable: false } }
+
+        # One invoice per customer per period. Concurrent close attempts cannot
+        # produce two.
+        - addUniqueConstraint:
+            tableName: invoice
+            columnNames: tenant_id, customer_id, period_start
+            constraintName: uq_invoice_tenant_customer_period
+
+        - sql:
+            sql: ALTER TABLE invoice ADD CONSTRAINT ck_invoice_status_known CHECK (status IN ('OPEN','CLOSED'))
+        - sql:
+            sql: ALTER TABLE invoice ADD CONSTRAINT ck_invoice_period_ordered CHECK (period_end > period_start)
+        # The split must always reconcile with the total. Cheap to enforce here,
+        # and it catches an aggregation bug at write time rather than in an audit.
+        - sql:
+            sql: >
+              ALTER TABLE invoice ADD CONSTRAINT ck_invoice_total_consistent
+              CHECK (total_amount = current_period_amount + adjustment_amount)
+        - sql:
+            sql: >
+              ALTER TABLE invoice ADD CONSTRAINT ck_invoice_closed_has_timestamp
+              CHECK ((status = 'CLOSED') = (closed_at IS NOT NULL))
+
+  # ---------------------------------------------------------------------------
+  # invoice_line -- one line per transaction code within a closed invoice.
+  # ---------------------------------------------------------------------------
+  - changeSet:
+      id: 006-02-invoice-line
+      author: jptoro
+      changes:
+        - createTable:
+            tableName: invoice_line
+            columns:
+              - column: { name: id, type: BIGINT, autoIncrement: true, constraints: { primaryKey: true, primaryKeyName: pk_invoice_line } }
+              - column: { name: tenant_id, type: TEXT, constraints: { nullable: false } }
+              - column: { name: invoice_id, type: BIGINT, constraints: { nullable: false } }
+              - column: { name: transaction_code, type: TEXT, constraints: { nullable: false } }
+              - column: { name: transaction_count, type: BIGINT, constraints: { nullable: false } }
+              - column: { name: total_quantity, type: "NUMERIC(19,6)", constraints: { nullable: false } }
+              # Sum of already-rounded per-transaction amounts, so every line
+              # reconciles to its events and the total reconciles to the lines.
+              - column: { name: amount, type: "NUMERIC(19,4)", constraints: { nullable: false } }
+              # Distinguishes this period's consumption from late adjustments
+              # carried in from an earlier one.
+              - column: { name: origin_period, type: DATE, constraints: { nullable: false } }
+              - column: { name: is_adjustment, type: BOOLEAN, defaultValueBoolean: false, constraints: { nullable: false } }
+
+        - addForeignKeyConstraint:
+            baseTableName: invoice_line
+            baseColumnNames: invoice_id
+            referencedTableName: invoice
+            referencedColumnNames: id
+            constraintName: fk_invoice_line_invoice
+            onDelete: CASCADE
+
+        # A code appears once per origin period within an invoice: this period's
+        # consumption and an August adjustment are separate lines.
+        - addUniqueConstraint:
+            tableName: invoice_line
+            columnNames: invoice_id, transaction_code, origin_period
+            constraintName: uq_invoice_line_code_origin
+
+        - sql:
+            sql: ALTER TABLE invoice_line ADD CONSTRAINT ck_invoice_line_amount_non_negative CHECK (amount >= 0)
+        - sql:
+            sql: ALTER TABLE invoice_line ADD CONSTRAINT ck_invoice_line_count_positive CHECK (transaction_count > 0)
+
+        - createIndex:
+            tableName: invoice_line
+            indexName: ix_invoice_line_invoice
+            columns:
+              - column: { name: invoice_id }
+      rollback:
+        - dropTable: { tableName: invoice_line }

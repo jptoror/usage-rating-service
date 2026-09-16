@@ -50,6 +50,7 @@ dependencies {
     implementation(libs.kotlin.logging)
 
     implementation(libs.liquibase.core)
+    implementation(libs.spring.boot.liquibase)
     implementation(libs.springdoc.openapi.webmvc.ui)
 
     runtimeOnly(libs.postgresql)

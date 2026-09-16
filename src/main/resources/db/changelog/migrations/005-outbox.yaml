@@ -1,0 +1,71 @@
+databaseChangeLog:
+
+  # ---------------------------------------------------------------------------
+  # outbox_message -- durable work queue.
+  #
+  # Written in the SAME transaction as raw_event, which is the whole point: it is
+  # impossible to accept an event and lose its work. Workers claim rows with
+  # FOR UPDATE SKIP LOCKED, so multiple instances take disjoint batches without
+  # blocking each other.
+  #
+  # Delivery is at-least-once, never exactly-once. Idempotency downstream is what
+  # makes that safe (see uq_rated_transaction_current).
+  # ---------------------------------------------------------------------------
+  - changeSet:
+      id: 005-01-outbox-message
+      author: jptoro
+      changes:
+        - createTable:
+            tableName: outbox_message
+            columns:
+              - column: { name: id, type: BIGINT, autoIncrement: true, constraints: { primaryKey: true, primaryKeyName: pk_outbox_message } }
+              - column: { name: tenant_id, type: TEXT, constraints: { nullable: false } }
+              - column: { name: raw_event_id, type: BIGINT, constraints: { nullable: false } }
+              # PENDING | PROCESSING | DONE | UNRATED | FAILED | QUARANTINED
+              - column: { name: status, type: TEXT, defaultValue: PENDING, constraints: { nullable: false } }
+              - column: { name: attempt_count, type: INTEGER, defaultValueNumeric: 0, constraints: { nullable: false } }
+              - column: { name: next_attempt_at, type: TIMESTAMPTZ, defaultValueComputed: now(), constraints: { nullable: false } }
+              - column: { name: last_error, type: TEXT }
+              - column: { name: created_at, type: TIMESTAMPTZ, defaultValueComputed: now(), constraints: { nullable: false } }
+              - column: { name: updated_at, type: TIMESTAMPTZ, defaultValueComputed: now(), constraints: { nullable: false } }
+
+        - addForeignKeyConstraint:
+            baseTableName: outbox_message
+            baseColumnNames: raw_event_id
+            referencedTableName: raw_event
+            referencedColumnNames: id
+            constraintName: fk_outbox_message_raw_event
+
+        # One queue entry per event: a re-delivered duplicate must not enqueue
+        # a second unit of work.
+        - addUniqueConstraint:
+            tableName: outbox_message
+            columnNames: tenant_id, raw_event_id
+            constraintName: uq_outbox_message_tenant_event
+
+        - sql:
+            sql: >
+              ALTER TABLE outbox_message ADD CONSTRAINT ck_outbox_status_known
+              CHECK (status IN ('PENDING','PROCESSING','DONE','UNRATED','FAILED','QUARANTINED'))
+        - sql:
+            sql: ALTER TABLE outbox_message ADD CONSTRAINT ck_outbox_attempts_non_negative CHECK (attempt_count >= 0)
+
+  - changeSet:
+      id: 005-02-outbox-claim-index
+      author: jptoro
+      comment: >
+        Partial index covering exactly the claim query. Excluding DONE keeps the
+        index small as the table grows, since the vast majority of rows end there.
+      changes:
+        - sql:
+            sql: >
+              CREATE INDEX ix_outbox_claimable
+              ON outbox_message (next_attempt_at, id)
+              WHERE status IN ('PENDING','UNRATED')
+            rollback: DROP INDEX ix_outbox_claimable
+        - createIndex:
+            tableName: outbox_message
+            indexName: ix_outbox_tenant_status
+            columns:
+              - column: { name: tenant_id }
+              - column: { name: status }
