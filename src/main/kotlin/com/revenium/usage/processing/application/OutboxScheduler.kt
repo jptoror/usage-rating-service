@@ -2,6 +2,7 @@ package com.revenium.usage.processing.application
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.annotation.PreDestroy
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import java.util.concurrent.atomic.AtomicBoolean
@@ -15,6 +16,11 @@ private val log = KotlinLogging.logger {}
  * waiting on a scheduler or sleeping -- a test that sleeps is a test that is either slow
  * or flaky, usually both.
  *
+ * Disabled entirely in integration tests via `outbox.scheduler-enabled=false`. Leaving it
+ * on meant it rated events in the background while a test was asserting on a known state,
+ * and while the cleaner was deleting between tests -- a race that produced foreign-key
+ * failures with no relationship to the test that reported them.
+ *
  * ### Graceful shutdown
  *
  * On SIGTERM the [shutdown] hook stops new cycles from starting, while the cycle already
@@ -23,6 +29,7 @@ private val log = KotlinLogging.logger {}
  * Nothing is lost either way; the shutdown just avoids leaving work in limbo.
  */
 @Component
+@ConditionalOnProperty(name = ["outbox.scheduler-enabled"], havingValue = "true", matchIfMissing = true)
 class OutboxScheduler(private val worker: OutboxWorker) {
 
     private val running = AtomicBoolean(true)

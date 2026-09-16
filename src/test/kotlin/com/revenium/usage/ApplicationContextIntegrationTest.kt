@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.context.ApplicationContext
 import kotlin.test.assertNotNull
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -38,12 +39,26 @@ class ApplicationContextIntegrationTest(@Autowired val context: ApplicationConte
             "invoiceService",
             "reconciliationService",
             "outboxWorker",
-            "outboxScheduler",
             "tenantGuardAspect",
             "instanceId",
         ).forEach { bean ->
             assertTrue(context.containsBean(bean), "missing bean: $bean")
         }
+    }
+
+    @Test
+    fun `the scheduler is disabled in tests, and that is deliberate`() {
+        // Integration tests drive the worker directly so they can assert on a known
+        // state. A scheduler running alongside them rates events in the background --
+        // including between the cleaner's deletes, which fails on a foreign key with no
+        // relationship to the test that reports it.
+        //
+        // Asserted rather than assumed: if someone re-enables it, the reason should
+        // surface here rather than as an unexplained flaky failure elsewhere.
+        assertFalse(
+            context.containsBean("outboxScheduler"),
+            "the scheduler should be off in integration tests (outbox.scheduler-enabled=false)",
+        )
     }
 
     @Test

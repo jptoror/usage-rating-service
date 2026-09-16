@@ -54,6 +54,18 @@ class PostgresContainerInitializer : ApplicationContextInitializer<ConfigurableA
             "spring.liquibase.url=${CONTAINER.jdbcUrl}",
             "spring.liquibase.user=${CONTAINER.username}",
             "spring.liquibase.password=${CONTAINER.password}",
+
+            // The scheduled worker is OFF during integration tests.
+            //
+            // Tests drive the worker directly, by calling pollOnce(), so they can assert
+            // on a known state. With the scheduler also running, it rates events in the
+            // background -- including between the cleaner's DELETE of rated_transaction
+            // and its DELETE of raw_event, which then fails on the foreign key.
+            //
+            // The race was always there; shortening the poll interval from 1s to 200ms
+            // for throughput made it frequent enough to see. OutboxSchedulerTest covers
+            // the scheduler's own behaviour in isolation.
+            "outbox.scheduler-enabled=false",
         )
     }
 
