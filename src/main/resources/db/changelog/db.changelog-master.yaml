@@ -1,0 +1,14 @@
+databaseChangeLog:
+  # Schema migrations. Each file is immutable once merged: corrections are new
+  # changesets, never edits to an applied one (Liquibase checksums enforce this).
+  - includeAll:
+      path: db/changelog/migrations
+      relativeToChangelogFile: false
+      errorIfMissingOrEmpty: false
+
+  # Representative pricing rules. Tagged `seed` so it can be excluded in
+  # environments that manage pricing elsewhere:  --contexts='!seed'
+  - includeAll:
+      path: db/changelog/seed
+      relativeToChangelogFile: false
+      errorIfMissingOrEmpty: false

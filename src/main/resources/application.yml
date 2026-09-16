@@ -1,0 +1,89 @@
+spring:
+  application:
+    name: usage-rating-service
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/usage_rating}
+    username: ${DB_USER:usage_app}
+    password: ${DB_PASSWORD:usage_app}
+    hikari:
+      # Pool sized for the web threads plus the outbox workers.
+      maximum-pool-size: ${DB_POOL_SIZE:15}
+      pool-name: usage-rating-pool
+
+  jpa:
+    open-in-view: false           # no lazy loading outside a transaction; forces explicit boundaries
+    hibernate:
+      ddl-auto: validate          # Liquibase owns the schema; Hibernate only verifies it matches
+    properties:
+      hibernate:
+        jdbc.time_zone: UTC
+        order_inserts: true
+        order_updates: true
+        jdbc.batch_size: 50
+
+  liquibase:
+    change-log: classpath:db/changelog/db.changelog-master.yaml
+    # Migrations run as the owner role, which is allowed to bypass RLS.
+    # The application itself connects as a non-privileged role (see README).
+    user: ${DB_MIGRATION_USER:${DB_USER:usage_app}}
+    password: ${DB_MIGRATION_PASSWORD:${DB_PASSWORD:usage_app}}
+
+  jackson:
+    default-property-inclusion: non_null
+    deserialization:
+      fail-on-unknown-properties: false   # forward compatible: upstream may add fields
+
+server:
+  shutdown: graceful
+  error:
+    include-message: always
+    include-stacktrace: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when-authorized
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+# ---------------------------------------------------------------------------
+# Domain configuration
+# ---------------------------------------------------------------------------
+billing:
+  # Currency fallback when a pricing rule does not pin one.
+  default-currency: ${BILLING_DEFAULT_CURRENCY:USD}
+  # Monetary scale and rounding applied once, when persisting a rated amount.
+  amount-scale: 4
+  rounding-mode: HALF_UP
+  late-arrival:
+    # Events older than this that land in a closed period are quarantined
+    # rather than billed, since they usually indicate an accidental replay.
+    max-age: ${BILLING_LATE_ARRIVAL_MAX_AGE:P90D}
+
+outbox:
+  poll-interval: ${OUTBOX_POLL_INTERVAL:1000ms}
+  batch-size: ${OUTBOX_BATCH_SIZE:50}
+  max-attempts: ${OUTBOX_MAX_ATTEMPTS:5}
+  # Exponential backoff base; attempt N waits base * 2^(N-1).
+  backoff-base: ${OUTBOX_BACKOFF_BASE:PT10S}
+  # Missing pricing rules are retried on a slower cadence, indefinitely:
+  # the rule may legitimately be created later.
+  unrated-retry-delay: ${OUTBOX_UNRATED_RETRY_DELAY:PT5M}
+
+logging:
+  level:
+    com.revenium.usage: ${LOG_LEVEL:INFO}

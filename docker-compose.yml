@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-usage_rating}
+      POSTGRES_USER: ${POSTGRES_USER:-usage_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-usage_owner}
+      # Passed through to the init script that creates the RLS-bound app role.
+      APP_DB_USER: ${DB_USER:-usage_app}
+      APP_DB_PASSWORD: ${DB_PASSWORD:-usage_app}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Waits for the database to actually accept connections, not just for
+      # the container to be up. The app depends on this condition.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-usage_owner} -d ${POSTGRES_DB:-usage_rating}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  app:
+    build:
+      context: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # The application connects as the unprivileged role, which is subject to
+      # row-level security. Liquibase connects as the owner to run migrations.
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-usage_rating}
+      DB_USER: ${DB_USER:-usage_app}
+      DB_PASSWORD: ${DB_PASSWORD:-usage_app}
+      DB_MIGRATION_USER: ${POSTGRES_USER:-usage_owner}
+      DB_MIGRATION_PASSWORD: ${POSTGRES_PASSWORD:-usage_owner}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
