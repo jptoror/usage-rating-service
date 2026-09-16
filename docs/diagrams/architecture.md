@@ -71,12 +71,21 @@ Arrows point inward. `domain` imports nothing from `api`, `application`,
 monetary arithmetic and period boundaries be unit-tested with no Spring context and no
 database.
 
-Cross-module calls go through a port owned by the **consuming** module:
+Cross-module calls go through a port owned by the **consuming** module — the module
+states what it needs, and the providing module supplies it:
 
-| Port | Owned by | Implemented by |
-| --- | --- | --- |
-| `PricingRuleLookup` | `pricing.domain` | `pricing.infrastructure` |
-| `BillingPeriodStatusLookup` | `invoicing.domain` | `invoicing.infrastructure` |
+| Port | Owned by | Implemented by | What it prevents |
+| --- | --- | --- | --- |
+| `PricingRuleLookup` | `pricing.domain` | `pricing.infrastructure` | rating depending on JPA |
+| `BillingPeriodStatusLookup` | `invoicing.domain` | `invoicing.infrastructure` | rating importing invoicing internals |
+| `ChargeLookup` | `invoicing.domain` | `rating.infrastructure` | invoicing holding `save`/`delete` on the ledger |
+| `RatingQueue` | `ingestion.domain` | `processing.infrastructure` | ingestion holding `delete` on the work queue |
+| `RateableTransaction` | `rating.domain` | mapped by `processing` | rating being drivable only by the outbox |
+
+Each of the last three replaced a direct dependency on another module's infrastructure.
+Two of them also removed **write access** a module had no business holding: invoicing
+could have deleted rated transactions, and ingestion could have emptied the outbox.
+`DependencyRuleTest` now fails the build if any of these regress.
 
 ---
 

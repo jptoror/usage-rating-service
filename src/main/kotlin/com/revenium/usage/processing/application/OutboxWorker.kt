@@ -7,6 +7,7 @@ import com.revenium.usage.processing.infrastructure.OutboxClaimRepository
 import com.revenium.usage.processing.infrastructure.OutboxMessageRepository
 import com.revenium.usage.rating.application.ConcurrentRatingException
 import com.revenium.usage.rating.application.RatingService
+import com.revenium.usage.rating.domain.RateableTransaction
 import com.revenium.usage.rating.domain.RatingOutcome
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
@@ -98,7 +99,7 @@ class OutboxWorker(
         // inherited from whatever this pool thread did previously.
         TenantContext.runAs(TenantId(work.tenantId)) {
             try {
-                when (val outcome = ratingService.rate(work)) {
+                when (val outcome = ratingService.rate(work.toRateable())) {
                     is RatingOutcome.Rated -> {
                         markDone(work)
                         log.debug {
@@ -128,6 +129,22 @@ class OutboxWorker(
             }
         }
     }
+
+    /**
+     * Maps a claimed queue row into the shape rating defines.
+     *
+     * The mapping lives here, in the consumer, so rating stays independent of how the
+     * work happened to be discovered.
+     */
+    private fun ClaimedWork.toRateable() = RateableTransaction(
+        tenantId = tenantId,
+        rawEventId = rawEventId,
+        customerId = customerId,
+        transactionCode = transactionCode,
+        occurredAt = occurredAt,
+        receivedAt = receivedAt,
+        quantity = quantity,
+    )
 
     private fun markDone(work: ClaimedWork) = status.markDone(work)
 

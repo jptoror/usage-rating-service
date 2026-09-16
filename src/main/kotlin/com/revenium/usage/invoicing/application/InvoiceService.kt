@@ -7,8 +7,8 @@ import com.revenium.usage.invoicing.domain.InvoiceSummary
 import com.revenium.usage.invoicing.domain.SummaryLine
 import com.revenium.usage.invoicing.infrastructure.InvoiceJpaRepository
 import com.revenium.usage.invoicing.infrastructure.InvoiceLineJpaRepository
-import com.revenium.usage.rating.domain.RatedTransaction
-import com.revenium.usage.rating.infrastructure.RatedTransactionRepository
+import com.revenium.usage.invoicing.domain.Charge
+import com.revenium.usage.invoicing.domain.ChargeLookup
 import com.revenium.usage.shared.domain.BillingPeriod
 import com.revenium.usage.shared.domain.CustomerId
 import com.revenium.usage.shared.domain.Money
@@ -41,7 +41,7 @@ private val log = KotlinLogging.logger {}
 @Service
 @RequiresTenant
 class InvoiceService(
-    private val ratedTransactions: RatedTransactionRepository,
+    private val charges: ChargeLookup,
     private val invoices: InvoiceJpaRepository,
     private val invoiceLines: InvoiceLineJpaRepository,
     private val defaultCurrency: Currency,
@@ -107,9 +107,7 @@ class InvoiceService(
         existing: Invoice?,
     ): InvoiceSummary {
         val tenant = TenantContext.current()
-        val rated = ratedTransactions.findCurrentForBillingPeriod(
-            tenant.value, customer.value, period.startDate,
-        )
+        val rated = charges.findChargesFor(tenant, customer, period)
 
         val currency = rated.firstOrNull()?.let { Currency.getInstance(it.currency) } ?: defaultCurrency
 
@@ -129,7 +127,7 @@ class InvoiceService(
      * rounded once when its transaction was rated, and recalculating would round the
      * aggregate differently, producing a total that no longer matches its own lines.
      */
-    private fun aggregate(rated: List<RatedTransaction>, currency: Currency): List<SummaryLine> =
+    private fun aggregate(rated: List<Charge>, currency: Currency): List<SummaryLine> =
         rated.groupBy { it.transactionCode to it.originPeriod }
             .map { (key, group) ->
                 val (code, originPeriod) = key
@@ -171,9 +169,7 @@ class InvoiceService(
             }
         }
 
-        val rated = ratedTransactions.findCurrentForBillingPeriod(
-            tenant.value, customer.value, period.startDate,
-        )
+        val rated = charges.findChargesFor(tenant, customer, period)
         val currency = rated.firstOrNull()?.let { Currency.getInstance(it.currency) } ?: defaultCurrency
         val lines = aggregate(rated, currency)
         val summary = InvoiceSummary.from(customer, period, currency, lines, InvoiceStatus.CLOSED)

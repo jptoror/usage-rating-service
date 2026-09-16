@@ -38,9 +38,28 @@ Java 21 is required: `export JAVA_HOME=$(/usr/libexec/java_home -v 21)`
 
 | | |
 | --- | --- |
-| Unit tests | 270 |
-| Integration tests | 37 (Testcontainers) |
-| Line coverage | **92.7%** against an 85% gate |
+| Unit tests | 274 |
+| Integration tests | 40 (Testcontainers) |
+| Line coverage | **90.7%** against an 85% gate |
+| Scripted checks | 22 end-to-end + 22 edge cases + 8 multi-instance |
+
+### Scripts
+
+```bash
+./scripts/start.sh --scale 3        # three instances behind nginx
+./scripts/e2e-test.sh --evidence    # every functional requirement
+./scripts/edge-case-test.sh         # boundaries through the full stack
+./scripts/multi-instance-test.sh    # coordination across separate processes
+./scripts/stop.sh --clean
+```
+
+Each asserts and exits non-zero on failure. `--evidence` writes a timestamped
+transcript to [`docs/evidence/`](docs/evidence/).
+
+### Documentation
+
+[`docs/`](docs/README.md) holds the architecture and sequence diagrams, a manual
+testing guide, a complexity analysis, and the evidence transcripts.
 
 ---
 
@@ -536,3 +555,23 @@ still in progress**:
 
 None of these were reachable from the unit tests, and only the first was reachable from
 the integration suite as originally written. All three now have regression tests.
+
+Three more surfaced only once the finished service was running under Docker Compose:
+
+- **A Kotlin `@JvmInline value class` as an injected constructor parameter** makes the
+  compiler emit a synthetic `DefaultConstructorMarker` that Spring tries to autowire.
+  Every unit test passed; the container would not start.
+  `ApplicationContextIntegrationTest` now asserts the context boots and that the tenant
+  guard is actually proxied.
+- **A malformed `period` query parameter returned 500 instead of 400**, telling an
+  integrator to retry and an operator to investigate when neither was right.
+- **`InvoicingIntegrationTest` was order-dependent**: tests shared one customer, so a
+  test that closed a period moved another test's charges from `RATED` to `INVOICED`. It
+  passed alone and failed in the suite.
+
+A review of the production sources then found three dependency-rule violations —
+rating taking the outbox's JDBC projection, invoicing injecting rating's JPA repository,
+ingestion injecting the outbox's. Two of them also handed a module **write access** it
+had no business holding: invoicing could have deleted rated transactions, ingestion
+could have emptied the work queue. Each is now a port owned by the consuming module, and
+`DependencyRuleTest` fails the build if any regresses.

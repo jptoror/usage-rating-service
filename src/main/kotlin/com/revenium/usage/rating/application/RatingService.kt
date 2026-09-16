@@ -1,7 +1,7 @@
 package com.revenium.usage.rating.application
 
 import com.revenium.usage.invoicing.domain.BillingPeriodStatusLookup
-import com.revenium.usage.processing.infrastructure.ClaimedWork
+import com.revenium.usage.rating.domain.RateableTransaction
 import com.revenium.usage.rating.domain.RatedTransaction
 import com.revenium.usage.rating.domain.RatingCalculator
 import com.revenium.usage.rating.domain.RatingOutcome
@@ -50,7 +50,7 @@ class RatingService(
 ) {
 
     @Transactional(propagation = Propagation.REQUIRES_NEW, isolation = Isolation.READ_COMMITTED)
-    fun rate(work: ClaimedWork): RatingOutcome {
+    fun rate(work: RateableTransaction): RatingOutcome {
         val tenant = TenantContext.current()
         require(tenant.value == work.tenantId) {
             "Rating ${work.rawEventId} for ${work.tenantId} while acting as $tenant"
@@ -84,7 +84,7 @@ class RatingService(
         return outcome
     }
 
-    private fun persist(tenant: TenantId, work: ClaimedWork, rated: RatingOutcome.Rated) {
+    private fun persist(tenant: TenantId, work: RateableTransaction, rated: RatingOutcome.Rated) {
         val row = RatedTransaction(
             tenantId = tenant.value,
             rawEventId = work.rawEventId,
