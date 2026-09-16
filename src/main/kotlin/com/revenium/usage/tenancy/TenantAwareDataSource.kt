@@ -22,8 +22,9 @@ import javax.sql.DataSource
  * connection from carrying one request's tenant into the next. Outside a transaction it
  * has no lasting effect, which is why tenant-scoped work is always transactional.
  *
- * A connection requested with no tenant in scope is left unset, and the policies then
- * match nothing: failing closed is the right default for isolation.
+ * A connection requested with no tenant in scope has the setting explicitly **cleared**,
+ * not merely left alone: leaving it alone would hand the previous borrower's tenant to
+ * the next caller. With it cleared, the policies match nothing, which fails closed.
  */
 class TenantAwareDataSource(delegate: DataSource) : DelegatingDataSource(delegate) {
 
@@ -33,13 +34,29 @@ class TenantAwareDataSource(delegate: DataSource) : DelegatingDataSource(delegat
         applyTenant(super.getConnection(username, password))
 
     private fun applyTenant(connection: Connection): Connection {
-        val tenant = TenantContext.currentOrNull() ?: return connection
+        // ALWAYS written, including when there is no tenant -- in which case it is
+        // written as NULL to clear it.
+        //
+        // Returning early on a null tenant would leave the PREVIOUS borrower's tenant on
+        // the connection, and the next unscoped caller would silently inherit it. That is
+        // exactly the cross-request leak row-level security exists to prevent, and it was
+        // a real bug here: the outbox worker's unscoped claim saw only one tenant's rows,
+        // because the connection it borrowed still carried the tenant of whoever used it
+        // last.
+        val tenant = TenantContext.currentOrNull()
 
         try {
             connection.prepareStatement(SET_TENANT_SQL).use { statement ->
                 // Bound, never interpolated: this statement is the mechanism that
                 // enforces isolation, so it must not be constructible from input.
-                statement.setString(1, tenant.value)
+                //
+                // set_config(..., NULL) leaves the setting NULL, which every policy
+                // treats as "no tenant" and therefore matches nothing. Failing closed.
+                if (tenant == null) {
+                    statement.setNull(1, java.sql.Types.VARCHAR)
+                } else {
+                    statement.setString(1, tenant.value)
+                }
                 statement.execute()
             }
         } catch (e: Exception) {

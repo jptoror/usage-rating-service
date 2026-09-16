@@ -1,0 +1,74 @@
+databaseChangeLog:
+
+  # ---------------------------------------------------------------------------
+  # Treat an empty app.tenant_id the same as an unset one.
+  #
+  # PostgreSQL does not round-trip NULL through set_config: writing NULL yields an
+  # EMPTY STRING, not NULL, and only a setting that was never written at all reads
+  # back as NULL. Verified directly:
+  #
+  #     SELECT current_setting('app.t', true);        -- NULL   (never set)
+  #     SELECT set_config('app.t', NULL, false);
+  #     SELECT current_setting('app.t', true);        -- ''     (not NULL)
+  #
+  # This matters because the connection pool must CLEAR the tenant when handing a
+  # connection to an unscoped caller -- otherwise the previous borrower's tenant
+  # leaks to the next one. Clearing writes '', so policies written against IS NULL
+  # silently stopped matching, and the outbox worker's claim saw nothing at all.
+  #
+  # The policies below accept either form. A tenant id is never blank -- TenantId
+  # rejects it in the domain and a CHECK rejects it in the database -- so treating
+  # '' as "no tenant" cannot collide with a real one.
+  # ---------------------------------------------------------------------------
+  - changeSet:
+      id: 010-01-empty-tenant-is-unset
+      author: jptoro
+      changes:
+        - sql:
+            splitStatements: false
+            sql: |
+              DROP POLICY IF EXISTS outbox_worker_claim ON outbox_message;
+              CREATE POLICY outbox_worker_claim ON outbox_message
+                  USING (coalesce(current_setting('app.tenant_id', true), '') = '')
+                  WITH CHECK (coalesce(current_setting('app.tenant_id', true), '') = '');
+
+              DROP POLICY IF EXISTS raw_event_worker_read ON raw_event;
+              CREATE POLICY raw_event_worker_read ON raw_event
+                  FOR SELECT
+                  USING (coalesce(current_setting('app.tenant_id', true), '') = '');
+            rollback: |
+              DROP POLICY IF EXISTS outbox_worker_claim ON outbox_message;
+              DROP POLICY IF EXISTS raw_event_worker_read ON raw_event;
+
+  - changeSet:
+      id: 010-02-tenant-isolation-rejects-empty
+      author: jptoro
+      comment: >
+        The isolation policies compare tenant_id against the setting directly, so an
+        empty setting already matches nothing (no tenant_id is blank). Recreated here
+        anyway with an explicit guard, so the intent is readable rather than implied:
+        an unscoped connection sees no tenant data at all.
+      changes:
+        - sql:
+            splitStatements: false
+            sql: |
+              DO $$
+              DECLARE
+                  t TEXT;
+                  tables TEXT[] := ARRAY[
+                      'raw_event', 'rejected_event', 'event_conflict',
+                      'pricing_rule', 'rated_transaction', 'outbox_message',
+                      'invoice', 'invoice_line'
+                  ];
+              BEGIN
+                  FOREACH t IN ARRAY tables LOOP
+                      EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
+                      EXECUTE format(
+                          'CREATE POLICY tenant_isolation ON %I
+                             USING (coalesce(current_setting(''app.tenant_id'', true), '''') <> ''''
+                                    AND tenant_id = current_setting(''app.tenant_id'', true))
+                             WITH CHECK (coalesce(current_setting(''app.tenant_id'', true), '''') <> ''''
+                                    AND tenant_id = current_setting(''app.tenant_id'', true))', t);
+                  END LOOP;
+              END $$;
+            rollback: SELECT 1

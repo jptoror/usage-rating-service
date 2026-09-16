@@ -47,13 +47,19 @@ class TenantAwareDataSourceTest {
     }
 
     @Test
-    fun `hands out an unscoped connection when no tenant is in scope`() {
-        // Liquibase and actuator legitimately run with no tenant. The policies then
-        // match nothing, which fails closed.
+    fun `clears the tenant when none is in scope, rather than leaving the last one`() {
+        // The bug this guards against was real: returning early on a null tenant left
+        // the PREVIOUS borrower's tenant on the pooled connection, and the next
+        // unscoped caller silently inherited it. The outbox worker's cross-tenant claim
+        // then saw only one tenant's rows.
+        //
+        // The setting is written as NULL instead, which every policy treats as "no
+        // tenant" -- failing closed.
         val handedOut = dataSource.connection
 
         assertSame(connection, handedOut)
-        verify(exactly = 0) { statement.execute() }
+        verify { statement.setNull(1, java.sql.Types.VARCHAR) }
+        verify { statement.execute() }
     }
 
     @Test

@@ -9,6 +9,12 @@ databaseChangeLog:
   # VEHICLE_REGISTRATION on tenant-a deliberately changes price mid-2026, so the
   # effective-dating boundary is demonstrable with two curl calls: an event on
   # 2026-06-30 rates at 2.00 and one on 2026-07-01 rates at 2.50.
+  #
+  # Timestamps use valueComputed with an explicit +00 offset, NOT valueDate.
+  # Liquibase's valueDate DISCARDS the 'Z' and stores the local-time equivalent, so
+  # on a machine in UTC-5 the changeover silently landed at 05:00 UTC instead of
+  # midnight -- five hours in which every event was billed at the wrong price. It was
+  # invisible in the seed file and only surfaced by asserting on a boundary event.
   # ---------------------------------------------------------------------------
   - changeSet:
       id: 100-01-seed-pricing-rules
@@ -22,8 +28,8 @@ databaseChangeLog:
               - column: { name: transaction_code, value: VEHICLE_REGISTRATION }
               - column: { name: unit_price, valueNumeric: 2.000000 }
               - column: { name: currency, value: USD }
-              - column: { name: effective_from, valueDate: 2026-01-01T00:00:00Z }
-              - column: { name: effective_to, valueDate: 2026-07-01T00:00:00Z }
+              - column: { name: effective_from, valueComputed: "TIMESTAMPTZ '2026-01-01 00:00:00+00'" }
+              - column: { name: effective_to, valueComputed: "TIMESTAMPTZ '2026-07-01 00:00:00+00'" }
               - column: { name: description, value: "Initial rate, H1 2026" }
 
         - insert:
@@ -35,8 +41,8 @@ databaseChangeLog:
               - column: { name: currency, value: USD }
               # Starts exactly where the previous rule ends: [from, to) means no
               # gap and no overlap at the changeover instant.
-              - column: { name: effective_from, valueDate: 2026-07-01T00:00:00Z }
-              - column: { name: effective_to, valueDate: null }
+              - column: { name: effective_from, valueComputed: "TIMESTAMPTZ '2026-07-01 00:00:00+00'" }
+              - column: { name: effective_to, value: null }
               - column: { name: description, value: "Rate increase from H2 2026, open ended" }
 
         - insert:
@@ -46,8 +52,8 @@ databaseChangeLog:
               - column: { name: transaction_code, value: TITLE_TRANSFER }
               - column: { name: unit_price, valueNumeric: 7.250000 }
               - column: { name: currency, value: USD }
-              - column: { name: effective_from, valueDate: 2026-01-01T00:00:00Z }
-              - column: { name: effective_to, valueDate: null }
+              - column: { name: effective_from, valueComputed: "TIMESTAMPTZ '2026-01-01 00:00:00+00'" }
+              - column: { name: effective_to, value: null }
               - column: { name: description, value: "Flat rate, open ended" }
 
         # Fractional unit price: exercises rounding rather than leaving it theoretical.
@@ -58,8 +64,8 @@ databaseChangeLog:
               - column: { name: transaction_code, value: RECORD_LOOKUP }
               - column: { name: unit_price, valueNumeric: 0.003333 }
               - column: { name: currency, value: USD }
-              - column: { name: effective_from, valueDate: 2026-01-01T00:00:00Z }
-              - column: { name: effective_to, valueDate: null }
+              - column: { name: effective_from, valueComputed: "TIMESTAMPTZ '2026-01-01 00:00:00+00'" }
+              - column: { name: effective_to, value: null }
               - column: { name: description, value: "Sub-cent unit price, exercises rounding" }
 
         # Second tenant, same transaction code at a different price: any
@@ -71,8 +77,8 @@ databaseChangeLog:
               - column: { name: transaction_code, value: VEHICLE_REGISTRATION }
               - column: { name: unit_price, valueNumeric: 3.750000 }
               - column: { name: currency, value: EUR }
-              - column: { name: effective_from, valueDate: 2026-01-01T00:00:00Z }
-              - column: { name: effective_to, valueDate: null }
+              - column: { name: effective_from, valueComputed: "TIMESTAMPTZ '2026-01-01 00:00:00+00'" }
+              - column: { name: effective_to, value: null }
               - column: { name: description, value: "Different tenant, different price and currency" }
       rollback:
         - delete:
