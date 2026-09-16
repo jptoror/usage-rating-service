@@ -2,6 +2,7 @@ package com.revenium.usage.invoicing.infrastructure
 
 import com.revenium.usage.invoicing.domain.BillingPeriodStatusLookup
 import com.revenium.usage.invoicing.domain.Invoice
+import com.revenium.usage.invoicing.domain.InvoiceLine
 import com.revenium.usage.invoicing.domain.InvoiceStatus
 import com.revenium.usage.shared.domain.BillingPeriod
 import com.revenium.usage.shared.domain.CustomerId
@@ -23,6 +24,13 @@ interface InvoiceJpaRepository : JpaRepository<Invoice, Long> {
         tenantId: String,
         customerId: String,
     ): List<Invoice>
+}
+
+@Repository
+interface InvoiceLineJpaRepository : JpaRepository<InvoiceLine, Long> {
+
+    /** Ordered so a closed invoice reads back the same way every time. */
+    fun findByInvoiceIdOrderByOriginPeriodAscTransactionCodeAsc(invoiceId: Long): List<InvoiceLine>
 }
 
 /**
