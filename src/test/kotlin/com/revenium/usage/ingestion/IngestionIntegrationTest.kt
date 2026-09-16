@@ -9,9 +9,11 @@ import com.revenium.usage.ingestion.infrastructure.RejectedEventRepository
 import com.revenium.usage.processing.domain.OutboxStatus
 import com.revenium.usage.processing.infrastructure.OutboxMessageRepository
 import com.revenium.usage.support.IntegrationTest
+import com.revenium.usage.support.PostgresContainerInitializer
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
@@ -42,23 +44,27 @@ class IngestionIntegrationTest(
     private val tenantA = TenantId("tenant-a")
     private val tenantB = TenantId("tenant-b")
 
+    /**
+     * Cleans BEFORE each test as well as after.
+     *
+     * Cleaning only afterwards leaves the first test of each class inheriting whatever
+     * the previous class left behind — the container is shared by the whole suite. Tests
+     * that count rows for a tenant then see a number that depends on execution order.
+     */
+    @BeforeEach
+    fun startFromAnEmptyDatabase() {
+        TenantContext.clear()
+        PostgresContainerInitializer.CLEANER.clear()
+    }
+
     @AfterEach
     fun cleanUp() {
         TenantContext.clear()
-        // DELETE rather than TRUNCATE: the application role is deliberately not the
-        // table owner, and TRUNCATE requires ownership. Scoped per tenant because RLS
-        // applies to this connection too -- a delete with no tenant in scope silently
-        // removes nothing, which would leave rows behind and make later tests fail in
-        // confusing ways.
-        listOf(tenantA, tenantB).forEach { tenant ->
-            TenantContext.runAs(tenant) {
-                jdbc.execute("DELETE FROM outbox_message")
-                jdbc.execute("DELETE FROM event_conflict")
-                jdbc.execute("DELETE FROM rated_transaction")
-                jdbc.execute("DELETE FROM rejected_event")
-                jdbc.execute("DELETE FROM raw_event")
-            }
-        }
+        // Cleared as the OWNER, in one pass: a per-tenant DELETE is scoped by row-level
+        // security, so rows belonging to a tenant this class does not know about survive
+        // and then block the foreign key on raw_event. That failed in CI while passing
+        // locally, which is the worst way to find out.
+        PostgresContainerInitializer.CLEANER.clear()
     }
 
     private fun input(
