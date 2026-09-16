@@ -152,6 +152,23 @@ class RatingServiceTest {
     }
 
     @Test
+    fun `a CHECK violation is a real failure, not a lost race`() {
+        // The bug this guards against: every DataIntegrityViolationException was reported
+        // as a concurrent-rating race, so the worker marked the message DONE and the
+        // charge vanished with nothing recording why. Only the unique index on the
+        // current rating means someone else won.
+        notYetRated()
+        every { ratedTransactions.saveAndFlush(any()) } throws
+            DataIntegrityViolationException("violates check constraint \"ck_rated_late_adjustment_consistent\"")
+
+        // Propagated as-is, so the worker retries and eventually dead-letters it rather
+        // than recording a charge that was never written.
+        assertFailsWith<DataIntegrityViolationException> {
+            TenantContext.runAs(tenant) { service.rate(work()) }
+        }
+    }
+
+    @Test
     fun `persists nothing when no pricing rule applies`() {
         notYetRated()
         val outcome = TenantContext.runAs(tenant) {

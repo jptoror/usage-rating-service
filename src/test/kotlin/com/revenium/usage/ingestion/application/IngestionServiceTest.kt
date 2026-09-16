@@ -38,7 +38,11 @@ class IngestionServiceTest {
     private val tenant = TenantId("tenant-a")
     private val eventUuid = UUID.fromString("73d4e120-77d0-4f11-a6d2-f3b43b430d9c")
 
-    private val rawEvents = mockk<RawEventRepository>()
+    private val rawEvents = mockk<RawEventRepository> {
+        // The duplicate path increments a delivery counter on the existing event, so
+        // that an identical re-delivery is still visible to reconciliation.
+        every { save(any()) } answers { firstArg() }
+    }
 
     // Stubbed explicitly rather than relaxed: a relaxed mock of a generic repository
     // returns a bare Object from save(), which fails with a ClassCastException only

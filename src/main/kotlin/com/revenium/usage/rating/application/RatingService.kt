@@ -107,15 +107,41 @@ class RatingService(
         try {
             ratedTransactions.saveAndFlush(row)
         } catch (e: DataIntegrityViolationException) {
-            // Another worker won the race between the check above and this insert. The
-            // database refused the second charge, which is exactly what it is there for.
-            log.debug(e) { "Concurrent rating of event ${work.rawEventId}; the other worker won" }
-            throw ConcurrentRatingException(work.rawEventId, e)
+            // Only a UNIQUE violation on the current-rating index means another worker
+            // won the race. Every other integrity violation -- a CHECK rejecting an
+            // inconsistent row, a foreign key pointing nowhere -- is a real defect.
+            //
+            // Treating them alike hid a genuine bug: a CHECK violation was reported as a
+            // lost race, the worker marked the message DONE, and the charge vanished
+            // silently. An event was accepted and never billed, with nothing recording why.
+            if (isDuplicateRatingViolation(e)) {
+                log.debug(e) { "Concurrent rating of event ${work.rawEventId}; the other worker won" }
+                throw ConcurrentRatingException(work.rawEventId, e)
+            }
+
+            log.error(e) { "Rating of event ${work.rawEventId} violated a database invariant" }
+            throw e
         }
     }
 
     private fun alreadyRated(existing: RatedTransaction): RatingOutcome.AlreadyRated =
         RatingOutcome.AlreadyRated(existing.id)
+
+    /**
+     * Whether this violation is the partial unique index refusing a second current
+     * rating -- the one integrity failure that is an expected outcome rather than a bug.
+     *
+     * Matched on the constraint name, which the database reports in the message chain.
+     */
+    private fun isDuplicateRatingViolation(e: DataIntegrityViolationException): Boolean =
+        generateSequence(e as Throwable) { it.cause }
+            .mapNotNull { it.message }
+            .any { it.contains(CURRENT_RATING_INDEX, ignoreCase = true) }
+
+    private companion object {
+        /** Mirrors the index created in changeset 004-02. */
+        const val CURRENT_RATING_INDEX = "uq_rated_transaction_current"
+    }
 }
 
 /**

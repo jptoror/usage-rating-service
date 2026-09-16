@@ -254,6 +254,35 @@ class InvoicingIntegrationTest(
         }
     }
 
+    @Test
+    fun `usage arriving after the CURRENT period is closed still gets billed`() {
+        // The scenario that exposed two bugs when run end to end: closing the period
+        // that is still in progress. The adjustment was assigned to that same closed
+        // period, the database CHECK rejected the insert, and the worker reported the
+        // message DONE -- an accepted event silently never billed.
+        ingest()
+        drain()
+        TenantContext.runAs(tenantA) { invoiceService.closePeriod(customer, currentPeriod) }
+
+        ingest(quantity = "4")
+        drain()
+
+        TenantContext.runAs(tenantA) {
+            // The closed invoice is untouched.
+            assertEquals("5.0000", invoiceService.summarise(customer, currentPeriod).totalAmount.amount.toPlainString())
+
+            // And the late charge landed in the next open period rather than vanishing.
+            val next = invoiceService.summarise(customer, currentPeriod.next())
+            assertEquals("10.0000", next.totalAmount.amount.toPlainString())
+            assertEquals("10.0000", next.adjustmentAmount.amount.toPlainString())
+            assertEquals(currentPeriod, next.lines.single().originPeriod)
+
+            // Nothing was lost: every accepted event is accounted for.
+            val report = reconciliationService.report(customer, currentPeriod)
+            assertTrue(report.isBalanced, report.imbalanceDescription() ?: "")
+        }
+    }
+
     // --- reconciliation ----------------------------------------------------
 
     @Test
@@ -361,6 +390,47 @@ class InvoicingIntegrationTest(
             val traced = lines.fold(BigDecimal.ZERO) { acc, l -> acc.add(l.amount.amount) }
             assertEquals(0, summary.totalAmount.amount.compareTo(traced))
         }
+    }
+
+    @Test
+    fun `an identical re-delivery is counted, not silently invisible`() {
+        // The gap this closes: an identical duplicate writes nothing -- the unique
+        // constraint rejects it, which is correct for billing -- so without a tally on
+        // the original event it would never appear in the report the brief requires.
+        val first = assertIsAccepted(ingest())
+        val eventId = TenantContext.runAs(tenantA) {
+            jdbc.queryForList("SELECT event_id FROM raw_event WHERE id = ?", first.rawEventId)
+                .first()["event_id"].toString()
+        }
+
+        // Three byte-identical re-deliveries, as a retry storm would produce.
+        repeat(3) {
+            TenantContext.runAs(tenantA) {
+                ingestionService.ingest(
+                    RawTransactionInput(
+                        eventId = eventId,
+                        tenantId = tenantA.value,
+                        customerId = customer.value,
+                        transactionCode = "VEHICLE_REGISTRATION",
+                        occurredAt = currentPeriod.start.plusSeconds(3600).toString(),
+                        quantity = BigDecimal("2"),
+                        rawPayload = """{"eventId":"$eventId"}""",
+                        payloadHash = eventId,
+                    )
+                )
+            }
+        }
+        drain()
+
+        val report = TenantContext.runAs(tenantA) {
+            reconciliationService.report(customer, currentPeriod)
+        }
+
+        // Each re-delivery is counted, not collapsed into one.
+        assertEquals(3, report.countOf(EventState.DUPLICATE))
+        assertEquals(1, report.countOf(EventState.RATED))
+        assertEquals(4, report.receivedCount)
+        assertTrue(report.isBalanced, report.imbalanceDescription() ?: "")
     }
 
     @Test
