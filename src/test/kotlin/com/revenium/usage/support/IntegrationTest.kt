@@ -61,6 +61,17 @@ class PostgresContainerInitializer : ApplicationContextInitializer<ConfigurableA
         const val APP_USER = "usage_app"
         const val APP_PASSWORD = "usage_app"
 
+        /**
+         * Cleanup runs as the owner, outside the Spring context.
+         *
+         * Registering it as a bean would give the application two `DataSource`
+         * candidates, and the one that bypasses row-level security could win.
+         */
+        @JvmStatic
+        val CLEANER: DatabaseCleaner by lazy {
+            DatabaseCleaner(CONTAINER.jdbcUrl, CONTAINER.username, CONTAINER.password)
+        }
+
         @JvmStatic
         val CONTAINER: PostgreSQLContainer<*> =
             PostgreSQLContainer("postgres:16-alpine")

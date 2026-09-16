@@ -11,6 +11,7 @@ import com.revenium.usage.reconciliation.domain.EventState
 import com.revenium.usage.shared.domain.BillingPeriod
 import com.revenium.usage.shared.domain.CustomerId
 import com.revenium.usage.support.IntegrationTest
+import com.revenium.usage.support.PostgresContainerInitializer
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
 import org.junit.jupiter.api.AfterEach
@@ -62,20 +63,27 @@ class InvoicingIntegrationTest(
     /** The period containing "now", so events fall inside the arrival cutoff. */
     private val currentPeriod = BillingPeriod(YearMonth.now(ZoneOffset.UTC))
 
+    /**
+     * Cleans BEFORE each test as well as after.
+     *
+     * Cleaning only afterwards leaves the first test of each class inheriting whatever
+     * the previous class left behind — the container is shared by the whole suite. Tests
+     * that count rows for a tenant then see a number that depends on execution order.
+     */
+    @BeforeEach
+    fun startFromAnEmptyDatabase() {
+        TenantContext.clear()
+        PostgresContainerInitializer.CLEANER.clear()
+    }
+
     @AfterEach
     fun cleanUp() {
         TenantContext.clear()
-        listOf(tenantA, tenantB).forEach { tenant ->
-            TenantContext.runAs(tenant) {
-                jdbc.execute("DELETE FROM invoice_line")
-                jdbc.execute("DELETE FROM invoice")
-                jdbc.execute("DELETE FROM outbox_message")
-                jdbc.execute("DELETE FROM rated_transaction")
-                jdbc.execute("DELETE FROM event_conflict")
-                jdbc.execute("DELETE FROM rejected_event")
-                jdbc.execute("DELETE FROM raw_event")
-            }
-        }
+        // Cleared as the OWNER, in one pass: a per-tenant DELETE is scoped by row-level
+        // security, so rows belonging to a tenant this class does not know about survive
+        // and then block the foreign key on raw_event. That failed in CI while passing
+        // locally, which is the worst way to find out.
+        PostgresContainerInitializer.CLEANER.clear()
     }
 
     private fun ingest(

@@ -17,10 +17,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # A new push to the same PR cancels the previous run: the old result is about to be
-  # stale anyway, and CI minutes are not free.
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on a PR -- the old result is about to be stale anyway, and CI
+  # minutes are not free. Never on `main`: a run there validates a commit that is already
+  # merged, and cancelling it leaves that commit unverified.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   JAVA_VERSION: '21'

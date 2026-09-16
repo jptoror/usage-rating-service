@@ -8,9 +8,11 @@ import com.revenium.usage.processing.domain.OutboxStatus
 import com.revenium.usage.processing.infrastructure.OutboxMessageRepository
 import com.revenium.usage.rating.infrastructure.RatedTransactionRepository
 import com.revenium.usage.support.IntegrationTest
+import com.revenium.usage.support.PostgresContainerInitializer
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
@@ -40,18 +42,27 @@ class OutboxWorkerIntegrationTest(
     private val tenantA = TenantId("tenant-a")
     private val tenantB = TenantId("tenant-b")
 
+    /**
+     * Cleans BEFORE each test as well as after.
+     *
+     * Cleaning only afterwards leaves the first test of each class inheriting whatever
+     * the previous class left behind — the container is shared by the whole suite. Tests
+     * that count rows for a tenant then see a number that depends on execution order.
+     */
+    @BeforeEach
+    fun startFromAnEmptyDatabase() {
+        TenantContext.clear()
+        PostgresContainerInitializer.CLEANER.clear()
+    }
+
     @AfterEach
     fun cleanUp() {
         TenantContext.clear()
-        listOf(tenantA, tenantB).forEach { tenant ->
-            TenantContext.runAs(tenant) {
-                jdbc.execute("DELETE FROM outbox_message")
-                jdbc.execute("DELETE FROM rated_transaction")
-                jdbc.execute("DELETE FROM event_conflict")
-                jdbc.execute("DELETE FROM rejected_event")
-                jdbc.execute("DELETE FROM raw_event")
-            }
-        }
+        // Cleared as the OWNER, in one pass: a per-tenant DELETE is scoped by row-level
+        // security, so rows belonging to a tenant this class does not know about survive
+        // and then block the foreign key on raw_event. That failed in CI while passing
+        // locally, which is the worst way to find out.
+        PostgresContainerInitializer.CLEANER.clear()
     }
 
     private fun ingest(
@@ -295,7 +306,11 @@ class OutboxWorkerIntegrationTest(
 
     @Test
     fun `an unrated event is rated once its pricing rule appears`() {
-        val rawEventId = ingest(code = "LATE_CODE")
+        // A code unique to this run: the cleaner deliberately leaves `pricing_rule`
+        // alone (it is seed data), so a fixed code would survive into the next run and
+        // the event would rate immediately instead of waiting.
+        val lateCode = "LATE_CODE_${System.nanoTime()}"
+        val rawEventId = ingest(code = lateCode)
         drain()
 
         TenantContext.runAs(tenantA) {
@@ -312,13 +327,26 @@ class OutboxWorkerIntegrationTest(
             jdbc.update(
                 """
                 INSERT INTO pricing_rule (tenant_id, transaction_code, unit_price, currency, effective_from)
-                VALUES ('tenant-a', 'LATE_CODE', 1.500000, 'USD', TIMESTAMPTZ '2026-01-01 00:00:00+00')
-                """
+                VALUES ('tenant-a', ?, 1.500000, 'USD', TIMESTAMPTZ '2026-01-01 00:00:00+00')
+                """,
+                lateCode,
             )
-            jdbc.update("UPDATE outbox_message SET next_attempt_at = now() WHERE raw_event_id = ?", rawEventId)
+            jdbc.update(
+                "UPDATE outbox_message SET status = 'PENDING', next_attempt_at = now() WHERE raw_event_id = ?",
+                rawEventId,
+            )
         }
 
-        drain()
+        // Not `drain()`: it treats UNRATED as terminal -- correctly, since an unrated
+        // message is waiting rather than working -- so it would return immediately
+        // without reprocessing this one. Poll until this specific event is rated.
+        repeat(30) {
+            worker.pollOnce()
+            val rated = TenantContext.runAs(tenantA) {
+                ratedTransactions.findCurrentByRawEventId(tenantA.value, rawEventId)
+            }
+            if (rated != null) return@repeat
+        }
 
         TenantContext.runAs(tenantA) {
             val rated = assertNotNull(ratedTransactions.findCurrentByRawEventId(tenantA.value, rawEventId))
