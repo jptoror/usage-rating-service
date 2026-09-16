@@ -42,10 +42,22 @@ class ReconciliationService(
     /**
      * Counts of every state for a customer and period, plus the amount billed.
      *
-     * The period is matched on `occurred_at` for raw events — what the customer used in
-     * that period — and on `billing_period` for rated transactions, which is what was
-     * charged. Those differ for late adjustments, and that difference is exactly what a
-     * reconciliation report exists to surface.
+     * ### Why this reports by ORIGIN period
+     *
+     * The report answers "does what we received in this period account for what we
+     * billed for it?", so both sides must be measured the same way. Events are counted
+     * by `occurred_at`; rated transactions are therefore counted by `origin_period`,
+     * which is the same instant expressed as a period — not by `billing_period`.
+     *
+     * Using `billing_period` was a real defect. A late adjustment occurs in one period
+     * and is charged in another, so it counted on the received side of its origin period
+     * and on the billed side of a later one. Neither period's arithmetic could ever
+     * balance, and the report said so — correctly, but about its own query rather than
+     * about the data.
+     *
+     * The invoice summary is the place `billing_period` belongs: it answers a different
+     * question, namely what a customer owes this period, and it reports adjustments
+     * separately precisely because the two differ.
      */
     @Transactional(readOnly = true)
     fun report(customer: CustomerId, period: BillingPeriod): ReconciliationReport {
@@ -69,14 +81,14 @@ class ReconciliationService(
             Long::class.java, tenant, customer.value, from, to,
         ) ?: 0
 
-        // A duplicate leaves no raw_event row of its own -- that is the point of the
-        // unique constraint -- so it is counted from the conflicts it produced plus the
-        // re-deliveries recorded against existing events.
+        // A duplicate creates no raw_event row of its own -- that is exactly what the
+        // unique constraint is for -- so it is counted from the tally kept on the event
+        // it duplicated. Summing the counter rather than counting rows means a retry
+        // storm is reported accurately instead of as a single duplicate.
         val duplicates = jdbc.queryForObject(
             """
-            SELECT count(*) FROM event_conflict c
-            JOIN raw_event e ON e.id = c.raw_event_id
-            WHERE c.tenant_id = ? AND e.customer_id = ? AND e.occurred_at >= ? AND e.occurred_at < ?
+            SELECT coalesce(sum(duplicate_delivery_count), 0) FROM raw_event
+            WHERE tenant_id = ? AND customer_id = ? AND occurred_at >= ? AND occurred_at < ?
             """,
             Long::class.java, tenant, customer.value, from, to,
         ) ?: 0
@@ -102,11 +114,13 @@ class ReconciliationService(
                    coalesce(sum(r.amount), 0) AS total,
                    min(r.currency) AS currency
             FROM rated_transaction r
+            -- Joined on billing_period: whether a charge is INVOICED depends on the
+            -- invoice it actually landed in, even while it is counted under its origin.
             LEFT JOIN invoice i
                    ON i.tenant_id = r.tenant_id
                   AND i.customer_id = r.customer_id
                   AND i.period_start = r.billing_period
-            WHERE r.tenant_id = ? AND r.customer_id = ? AND r.billing_period = ?
+            WHERE r.tenant_id = ? AND r.customer_id = ? AND r.origin_period = ?
               AND r.superseded_by IS NULL
             GROUP BY coalesce(i.status, 'OPEN')
             """,
@@ -167,6 +181,9 @@ class ReconciliationService(
      *
      * This is the second step of the trace: a summary line says a code is worth X across
      * N transactions, and this lists those N rows with the numbers that produced X.
+     *
+     * Matched on `billing_period`, unlike [report]: this traces an invoice figure, and an
+     * invoice contains exactly what was charged in its period, adjustments included.
      */
     @Transactional(readOnly = true)
     fun lines(

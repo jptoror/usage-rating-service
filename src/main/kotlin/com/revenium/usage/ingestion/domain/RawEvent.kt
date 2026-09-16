@@ -60,8 +60,30 @@ class RawEvent(
     @Column(name = "received_at", nullable = false, updatable = false)
     val receivedAt: Instant = Instant.now(),
 
+    /**
+     * How many times this event has been delivered again after the first time.
+     *
+     * The one mutable field on this table. An identical re-delivery writes nothing
+     * else -- the unique constraint rejects it, which is the point -- so without a
+     * tally here, duplicates would be invisible to the reconciliation report the
+     * brief requires. A counter rather than a row per delivery: a retry storm can
+     * repeat one event thousands of times.
+     */
+    @Column(name = "duplicate_delivery_count", nullable = false)
+    var duplicateDeliveryCount: Long = 0,
+
+    @Column(name = "last_duplicate_at")
+    var lastDuplicateAt: Instant? = null,
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     @Column(name = "id")
     val id: Long = 0,
-)
+) {
+
+    /** Records another delivery of this same event. */
+    fun recordDuplicateDelivery(at: Instant) {
+        duplicateDeliveryCount += 1
+        lastDuplicateAt = at
+    }
+}

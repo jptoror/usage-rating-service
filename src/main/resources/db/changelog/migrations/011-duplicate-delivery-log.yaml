@@ -1,0 +1,41 @@
+databaseChangeLog:
+
+  # ---------------------------------------------------------------------------
+  # Counters for re-deliveries.
+  #
+  # An identical re-delivery leaves no trace by design: the unique constraint
+  # rejects the insert and nothing new is written. That is correct for billing,
+  # but it made duplicates invisible to the reconciliation report -- which the
+  # brief explicitly requires to distinguish them.
+  #
+  # Counters on raw_event rather than a row per re-delivery: a retry storm can
+  # deliver the same event thousands of times, and one row each would grow without
+  # bound while answering the same question a counter answers. The exception is a
+  # payload conflict, which stays in event_conflict as full evidence because a
+  # human has to look at it.
+  #
+  # This is the one place a raw_event row is mutated. The evidence columns -- the
+  # payload, its hash, the timestamps -- remain immutable; only the tally moves.
+  # ---------------------------------------------------------------------------
+  - changeSet:
+      id: 011-01-duplicate-counters
+      author: jptoro
+      changes:
+        - addColumn:
+            tableName: raw_event
+            columns:
+              - column:
+                  name: duplicate_delivery_count
+                  type: BIGINT
+                  defaultValueNumeric: 0
+                  constraints: { nullable: false }
+              - column:
+                  name: last_duplicate_at
+                  type: TIMESTAMPTZ
+        - sql:
+            sql: >
+              ALTER TABLE raw_event ADD CONSTRAINT ck_raw_event_duplicate_count_non_negative
+              CHECK (duplicate_delivery_count >= 0)
+      rollback:
+        - dropColumn: { tableName: raw_event, columnName: duplicate_delivery_count }
+        - dropColumn: { tableName: raw_event, columnName: last_duplicate_at }

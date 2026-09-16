@@ -56,13 +56,21 @@ class ReconciliationServiceTest {
         ratedClosed: Pair<Long, String>? = null,
     ) {
         every {
-            jdbc.queryForObject(match<String> { it.contains("FROM raw_event") }, Long::class.java, *anyVararg())
+            jdbc.queryForObject(
+                match<String> { it.contains("count(*) FROM raw_event") },
+                Long::class.java,
+                *anyVararg(),
+            )
         } returns received
         every {
             jdbc.queryForObject(match<String> { it.contains("FROM rejected_event") }, Long::class.java, *anyVararg())
         } returns rejected
         every {
-            jdbc.queryForObject(match<String> { it.contains("FROM event_conflict") }, Long::class.java, *anyVararg())
+            jdbc.queryForObject(
+                match<String> { it.contains("sum(duplicate_delivery_count)") },
+                Long::class.java,
+                *anyVararg(),
+            )
         } returns duplicates
 
         every {
@@ -169,7 +177,7 @@ class ReconciliationServiceTest {
 
         verify {
             jdbc.queryForObject(
-                match<String> { it.contains("FROM raw_event") },
+                match<String> { it.contains("count(*) FROM raw_event") },
                 Long::class.java,
                 "tenant-b", customer.value, any(), any(),
             )

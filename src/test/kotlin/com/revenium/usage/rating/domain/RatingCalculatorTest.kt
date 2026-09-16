@@ -232,6 +232,42 @@ class RatingCalculatorTest {
     }
 
     @Test
+    fun `a late adjustment skips a closed current period`() {
+        // Found end to end: an operator closed the period that was still in progress, so
+        // "the period containing now" was itself closed. The adjustment was assigned to
+        // the same period as its origin, which both contradicts the policy and violates
+        // the database CHECK that a late adjustment's two periods must differ -- the
+        // insert was rejected and the charge vanished.
+        val augustAndSeptemberClosed: (BillingPeriod) -> Boolean = {
+            it == BillingPeriod(YearMonth.of(2026, 8)) || it == BillingPeriod(YearMonth.of(2026, 9))
+        }
+
+        val outcome = calculator(rule()).rate(request(), augustAndSeptemberClosed, now)
+
+        val rated = assertIs<RatingOutcome.Rated>(outcome)
+        assertEquals(BillingPeriod(YearMonth.of(2026, 8)), rated.originPeriod)
+        assertEquals(BillingPeriod(YearMonth.of(2026, 10)), rated.billingPeriod)
+        assertTrue(rated.isLateAdjustment)
+    }
+
+    @Test
+    fun `a late adjustment's periods always differ`() {
+        // The invariant the database CHECK enforces, asserted here so a regression fails
+        // in a unit test rather than as a rejected insert in production.
+        val everythingClosedUntilDecember: (BillingPeriod) -> Boolean = {
+            it < BillingPeriod(YearMonth.of(2026, 12))
+        }
+
+        val rated = assertIs<RatingOutcome.Rated>(
+            calculator(rule()).rate(request(), everythingClosedUntilDecember, now)
+        )
+
+        assertTrue(rated.isLateAdjustment)
+        assertTrue(rated.billingPeriod != rated.originPeriod)
+        assertEquals(BillingPeriod(YearMonth.of(2026, 12)), rated.billingPeriod)
+    }
+
+    @Test
     fun `a late adjustment lands in the current period, not the one after its own`() {
         // A January event arriving in September must not be charged to February, which
         // closed months ago -- it goes to the period that is actually open now.

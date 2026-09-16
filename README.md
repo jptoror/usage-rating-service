@@ -1,52 +1,435 @@
 # Usage Rating and Invoice Reconciliation Service
 
 Ingests customer usage transactions, rates them under effective-dated pricing rules,
-produces invoice summaries, and exposes reconciliation evidence.
+produces invoice summaries, and exposes reconciliation evidence linking every billed
+amount back to the events and pricing rules behind it.
 
-> **Status: scaffolding.** Build, configuration, module layout and the coverage gate
-> are in place and verified. Domain implementation is in progress — see
-> [Implementation status](#implementation-status).
+Kotlin 2.4 · Spring Boot 4.1 · PostgreSQL 16 · Liquibase · Gradle (Kotlin DSL)
 
-## Requirements
-
-- JDK 21 (the build declares a toolchain; `export JAVA_HOME=$(/usr/libexec/java_home -v 21)`)
-- Docker, for integration tests and for `docker compose`
+---
 
 ## Quick start
 
 ```bash
-cp .env.example .env          # adjust credentials
-docker compose up --build     # Postgres + app, migrations applied on startup
+cp .env.example .env            # adjust credentials
+docker compose up --build       # Postgres + app, migrations applied on startup
 ```
-
-The service listens on `http://localhost:8080`:
 
 | | |
 | --- | --- |
-| Health | `http://localhost:8080/actuator/health` |
-| OpenAPI | `http://localhost:8080/v3/api-docs` |
-| Swagger UI | `http://localhost:8080/swagger-ui.html` |
+| Health | http://localhost:8080/actuator/health |
+| OpenAPI | http://localhost:8080/v3/api-docs |
+| Swagger UI | http://localhost:8080/swagger-ui.html |
 
-## Build and test
+### Build and test
 
 ```bash
-./gradlew check              # compile + unit tests + integration tests + coverage gate
-./gradlew test               # unit tests only, no Docker needed
-./gradlew integrationTest    # integration tests only, requires Docker
-./gradlew jacocoTestReport   # -> build/reports/jacoco/test/html/index.html
+./gradlew check                 # compile + unit tests + integration tests + coverage gate
+./gradlew test                  # unit tests only (fast, no Docker)
+./gradlew integrationTest       # integration tests only (requires Docker)
+./gradlew jacocoTestReport      # -> build/reports/jacoco/test/html/index.html
 ```
 
 `./gradlew check` is the single command that builds and verifies everything.
 
+Java 21 is required: `export JAVA_HOME=$(/usr/libexec/java_home -v 21)`
+
+### Current state
+
+| | |
+| --- | --- |
+| Unit tests | 270 |
+| Integration tests | 37 (Testcontainers) |
+| Line coverage | **92.7%** against an 85% gate |
+
+---
+
+## Worked example
+
+Every command below runs against `docker compose up`.
+
+### 1 — Ingest a transaction
+
+```bash
+curl -s -X POST localhost:8080/api/v1/transactions \
+  -H 'X-Tenant-Id: tenant-a' -H 'Content-Type: application/json' -d '{
+    "eventId": "73d4e120-77d0-4f11-a6d2-f3b43b430d9c",
+    "tenantId": "tenant-a",
+    "customerId": "customer-42",
+    "transactionCode": "VEHICLE_REGISTRATION",
+    "occurredAt": "2026-08-15T14:22:31Z",
+    "metadata": {"source": "upstream-api", "quantity": 2, "batchId": "batch-2026-08-15-01"}
+  }'
+```
+
+```json
+{ "status": "ACCEPTED", "eventId": "73d4e120-…", "receivedAt": "2026-09-16T10:00:00Z" }
+```
+
+### 2 — Re-deliver the same event
+
+Running the identical command again returns `200`, not `409`:
+
+```json
+{ "status": "DUPLICATE", "eventId": "73d4e120-…", "originalReceivedAt": "2026-09-16T10:00:00Z" }
+```
+
+### 3 — Summarise the period
+
+```bash
+curl -s -G localhost:8080/api/v1/invoices/summary \
+  -H 'X-Tenant-Id: tenant-a' \
+  --data-urlencode 'customerId=customer-42' \
+  --data-urlencode 'period=2026-08'
+```
+
+```json
+{
+  "period": "2026-08",
+  "currency": "USD",
+  "status": "OPEN",
+  "lines": [
+    { "transactionCode": "VEHICLE_REGISTRATION", "transactionCount": 1,
+      "amount": 5.0000, "originPeriod": "2026-08", "isAdjustment": false }
+  ],
+  "currentPeriodAmount": 5.0000,
+  "adjustmentAmount": 0.0000,
+  "totalAmount": 5.0000
+}
+```
+
+### 4 — Trace the total back to its events
+
+```bash
+curl -s -G localhost:8080/api/v1/reconciliation/lines \
+  -H 'X-Tenant-Id: tenant-a' \
+  --data-urlencode 'customerId=customer-42' \
+  --data-urlencode 'period=2026-08'
+```
+
+```json
+[{ "eventId": "73d4e120-…", "quantity": 2, "unitPrice": 2.500000,
+   "amount": 5.0000, "pricingRuleId": 2, "state": "RATED" }]
+```
+
+`2 × 2.500000 = 5.0000`, and `GET /api/v1/pricing-rules/2` shows the rule that supplied
+the price. Every amount in the system decomposes this way.
+
+### 5 — Check that what arrived accounts for what was billed
+
+```bash
+curl -s -G localhost:8080/api/v1/reconciliation/report \
+  -H 'X-Tenant-Id: tenant-a' \
+  --data-urlencode 'customerId=customer-42' \
+  --data-urlencode 'period=2026-08'
+```
+
+```json
+{ "receivedCount": 2, "balanced": true, "imbalance": null,
+  "states": [ { "state": "RATED", "count": 1, "amount": 5.0000 },
+              { "state": "DUPLICATE", "count": 1 } ] }
+```
+
+### 6 — Close the period, then send a late event
+
+```bash
+curl -s -X POST 'localhost:8080/api/v1/invoices/close?customerId=customer-42&period=2026-08' \
+  -H 'X-Tenant-Id: tenant-a'
+```
+
+A transaction for August arriving now is charged in the open period as an adjustment,
+while August's closed invoice stays exactly as it was.
+
+---
+
+## Architecture
+
+### Module layout
+
+```
+com.revenium.usage
+├─ ingestion       accepting transactions, idempotency, evidence
+├─ rating          applying pricing rules, monetary calculation
+├─ pricing         effective-dated pricing rules
+├─ invoicing       billing periods, summaries, period close
+├─ reconciliation  processing states, reports, traceability
+├─ tenancy         TenantContext, @RequiresTenant, aspect, RLS plumbing
+├─ processing      outbox, worker, retries, dead letters
+└─ shared          domain primitives, errors, configuration
+```
+
+Each module is layered `api → application → domain`, with `infrastructure → domain`.
+**The `domain` layer depends on nothing else in the project**, which is what lets the
+rating rules, monetary arithmetic and period boundaries be unit-tested with no Spring
+context and no database.
+
+Cross-module calls go through a port owned by the *consuming* module — `PricingRuleLookup`
+and `BillingPeriodStatusLookup` are both interfaces in the domain, implemented in
+infrastructure.
+
+### Data model
+
+| Table | Role | Key invariant |
+| --- | --- | --- |
+| `raw_event` | The payload exactly as it arrived. Immutable | `UNIQUE (tenant_id, event_id)` |
+| `rejected_event` | Validation failures, with reasons | written in its own transaction |
+| `event_conflict` | Same event id, different body | first delivery always wins |
+| `pricing_rule` | Effective-dated unit price | `EXCLUDE` prevents overlapping validity |
+| `rated_transaction` | The calculated charge | partial unique index: one current row per event |
+| `outbox_message` | Durable work queue | one queue entry per event |
+| `invoice` / `invoice_line` | Frozen totals for a closed period | `CHECK (total = current + adjustment)` |
+
+The split that matters is **evidence** (`raw_event`, never modified) from **result**
+(`rated_transaction`, recomputable). A correction inserts a new rated row and points the
+old one at it through `superseded_by`; nothing is ever updated in place, so the history
+of what was billed and why stays intact.
+
+`rated_transaction` records the `pricing_rule_id` **and** a copy of the `unit_price`.
+The redundancy is deliberate: when a rule is later corrected, every amount calculated
+under it must keep explaining itself without depending on the current pricing table.
+
+### Transaction boundaries
+
+| Boundary | Propagation | Isolation | Why |
+| --- | --- | --- | --- |
+| Ingestion (`EventRecorder`) | `REQUIRES_NEW` | `READ_COMMITTED` | event + outbox row commit together |
+| Duplicate resolution | `REQUIRES_NEW` | `READ_COMMITTED` | needs a clean session after a constraint violation |
+| Rejection record | `REQUIRES_NEW` | `READ_COMMITTED` | evidence must survive the caller's rollback |
+| Rating (per message) | `REQUIRES_NEW` | `READ_COMMITTED` | one poison message must not roll back its batch |
+| Period close | `REQUIRED` | `REPEATABLE_READ` | header and lines must come from one snapshot |
+
+Ingestion writes the event and its outbox row in **one** transaction. That is the whole
+guarantee of the outbox pattern: there is no window in which an event is accepted but its
+rating work is lost.
+
+`REQUIRES_NEW` on ingestion is not decorative. A unique-constraint violation marks the
+surrounding transaction **rollback-only**, so catching the exception and carrying on still
+fails at commit — and leaves the Hibernate session unusable, since the rejected entity
+keeps a null identifier and poisons the next flush. Isolating the insert means a duplicate
+is an ordinary result rather than a poisoned unit of work.
+
+### Asynchronous processing
+
+**Outbox table polled with `SELECT … FOR UPDATE SKIP LOCKED`.**
+
+`SKIP LOCKED` makes a second worker step over rows another worker already holds, so any
+number of instances take **disjoint** batches with no leader election, no distributed lock
+and no broker.
+
+A broker was considered and rejected: publishing to Kafka and writing to Postgres are not
+atomic, so a correct implementation needs an outbox table *anyway*. Adding the broker would
+add a container and several failure modes without adding correctness at this scale.
+
+**Guarantees and limits**, explicitly:
+
+- **At-least-once, never exactly-once.** A worker that dies mid-transaction releases its
+  locks and the rows become claimable again. Safe only because `rated_transaction` carries
+  a partial unique index — the idempotency is in the database, not in the worker.
+- **Ordering is not preserved** across workers. Acceptable here: rating one event never
+  depends on another. Per-customer ordering would require partitioning the claim.
+- **Retries** use exponential backoff, then dead-letter as `FAILED`. Nothing is discarded.
+- **`UNRATED` is not a failure.** A missing pricing rule does not count against the retry
+  budget: the rule may be created tomorrow, and the event must still be waiting when it is.
+- **Abandoned claims** are reclaimed after a timeout, so a killed worker loses no work.
+- **Throughput** is on the order of thousands of messages per minute per instance. The
+  migration path, if that were ever insufficient, is to publish the outbox to Kafka with
+  Debezium without touching the domain.
+
+### Idempotency
+
+Duplicate detection is an `INSERT` that catches the unique-constraint violation, **not** a
+`SELECT` followed by an `INSERT`. A read-then-write has a race window that concurrent
+delivery will find, and at that point both callers believe they are first. The database
+arbitrates instead.
+
+An integration test releases ten threads simultaneously on the same event id and asserts
+exactly one `ACCEPTED`, nine `DUPLICATE`, one row and one unit of work.
+
+**A duplicate returns `200`, not `409`.** Re-delivery is the upstream retry working exactly
+as intended, not a client error; a `4xx` would prompt integrations to retry or alert over
+correct behaviour. The `status` field distinguishes the cases and duplicates are visible in
+reconciliation. This is a judgement call and reasonable people differ.
+
+**Same event id with a different body** is a defect upstream that cannot be resolved
+automatically: accepting the second delivery would double-bill, discarding it silently
+would hide a real problem. The first delivery wins, the discrepancy is recorded in
+`event_conflict`, and the reconciliation report surfaces it for a human.
+
+### Tenant isolation
+
+Three independent layers, because the brief is explicit that a `tenantId` in the payload is
+not sufficient — the payload is entirely under the caller's control.
+
+1. **`X-Tenant-Id` header → `TenantContext`.** The header is the only source of identity. A
+   `tenantId` in the body is data to validate against it; a mismatch is rejected. In
+   production this would be a gateway or a JWT claim, and that swap is confined to one class.
+2. **`@RequiresTenant` + `TenantGuardAspect`.** Fails fast at service boundaries.
+3. **PostgreSQL row-level security.** The backstop.
+
+**The application connects as `usage_app`, which has `NOBYPASSRLS` and owns no tables.**
+Both a superuser and a table owner bypass RLS unconditionally — even with
+`FORCE ROW LEVEL SECURITY` — so the connecting role is the whole mechanism. Liquibase
+connects separately as the owner to run migrations.
+
+Consequence: **a query that forgets its tenant filter returns nothing rather than leaking**.
+An integration test issues a deliberately unfiltered `SELECT` and asserts zero foreign rows
+while two tenants' rows exist.
+
+#### AOP specifics the brief asks about
+
+- **Pointcut.** `@annotation(RequiresTenant) || @within(RequiresTenant)` — individual
+  methods and every public method of an annotated class. Applied at the *service* boundary,
+  where a unit of work begins and there is context for a useful error.
+- **Advice ordering.** `HIGHEST_PRECEDENCE + 100`, ahead of transaction advice. A
+  cross-tenant call is rejected before a transaction is opened and before a connection is
+  used. Ordering it after would still be correct but would burn a pooled connection on every
+  rejected call.
+- **Proxy and self-invocation.** Spring AOP is proxy-based, so `this.annotatedMethod()`
+  from inside the same class **bypasses the proxy and the aspect does not run**. This is
+  proven by a test rather than assumed away — and the same test shows RLS still returns
+  nothing, which is precisely the argument for defence in depth. `AopContext.currentProxy()`
+  and load-time weaving were both rejected as complexity that does not pay.
+- **Async propagation.** A `ThreadLocal` does not cross a thread pool boundary. The outbox
+  worker re-establishes scope from the tenant on each claimed row via
+  `TenantContext.runAs(…)`; `TenantAwareTaskDecorator` captures at submission time for
+  `@Async` work. **Nothing is inherited implicitly** — a half-inherited context is worse
+  than none.
+
+#### The worker's cross-tenant exemption
+
+The worker must discover work across tenants, which is exactly what RLS prevents. Three
+options, only one acceptable:
+
+1. Run the worker with `BYPASSRLS` — rejected: one bug in the worker then reads everything.
+2. Loop over known tenants — rejected: needs a registry, scales with tenant count, starves
+   tenants at the end of the list.
+3. **Narrow the exemption to what the claim needs** — chosen.
+
+A policy lets a connection with **no** tenant set see outbox rows and read events, and
+nothing else: it cannot write a charge or read any other tenant-scoped table. Each message
+is then rated inside `runAs(…)` with the tenant from its own row.
+
+### Late-arrival policy
+
+**A closed invoice is immutable. A transaction arriving after its period closed is rated at
+its original period's price and charged as an adjustment in the open period.**
+
+| Policy | For | Against |
+| --- | --- | --- |
+| **Adjustment in the next open period** | A customer never sees a figure change after being billed. Standard accounting practice. No recomputation | A period's total no longer equals that period's consumption |
+| Reopen and version the invoice | Each period reflects its real consumption | A customer who already paid receives a different invoice |
+| Reject outside a window | Trivial | Loses real revenue over an integration's failure |
+
+The trade-off is real, so the summary reports `currentPeriodAmount` and `adjustmentAmount`
+**separately** rather than hiding the adjustment inside a total. With `origin_period` on
+every rated row, August's true consumption is still a single query away.
+
+**Cutoff** (`BILLING_LATE_ARRIVAL_MAX_AGE`, default 90 days): beyond it an event is
+`QUARANTINED` — neither billed nor discarded — for a human to decide, because an event that
+old almost always means an accidental replay.
+
+The cutoff measures **`receivedAt − occurredAt`**, not the event's age. Measuring age would
+quarantine a deliberate reprocess of six-month-old data purely because the usage is old,
+even though it arrived on time. The question the cutoff asks is *"did this only just turn
+up?"*, and `receivedAt` is the field that answers it.
+
+### Monetary correctness
+
+- `BigDecimal` in Kotlin, `NUMERIC` in PostgreSQL. **No `Double` or `Float` anywhere near an
+  amount.** Unit prices at scale 6, amounts at scale 4.
+- **Rounded once**, `HALF_UP`, per transaction, when the amount is produced. Never on an
+  intermediate, never on a total.
+- An invoice total is the **sum of already-rounded line amounts**, and each line is the sum
+  of its transactions' amounts. No step rounds twice, so the arithmetic closes exactly at
+  every level — a total always equals the sum of its own lines.
+- Comparison uses `compareTo`, never `equals`: `BigDecimal("2.0") != BigDecimal("2.00")`.
+
+Pricing rule validity is `[effectiveFrom, effectiveTo)` — **start inclusive, end exclusive**.
+The half-open interval removes ambiguity at the changeover instant, which is where
+off-by-one-cent bugs live. Billing periods use the same convention.
+
+### Reconciliation
+
+Every received event is in exactly one state — `REJECTED`, `DUPLICATE`, `ACCEPTED`,
+`UNRATED`, `RATED`, `INVOICED`, `FAILED`, `QUARANTINED` — derived from the tables rather
+than stored on a status column, so there is no second copy of the truth to drift.
+
+The report evaluates its own arithmetic and says when it fails:
+
+```
+received = accepted + duplicates + rejected
+accepted = rated + invoiced + unrated + failed + quarantined
+```
+
+`balanced: false` means a defect in the service, not an accounting subtlety, and
+`imbalance` names the equation that failed.
+
+Tracing a figure takes three steps: the summary line names a code and a total, `/lines`
+returns the transactions behind it with quantity, unit price and rule id, and
+`/pricing-rules/{id}` returns the rule. An integration test walks exactly that path and
+re-derives every amount.
+
+---
+
+## API
+
+All endpoints require `X-Tenant-Id`. Errors are RFC 7807 `application/problem+json`; a
+stack trace never reaches a client.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/v1/transactions` | Ingest one transaction |
+| `POST` | `/api/v1/transactions/batch` | Ingest a batch, per-item results |
+| `GET` | `/api/v1/invoices/summary` | Summary for a customer and period |
+| `POST` | `/api/v1/invoices/close` | Close a period (administrative) |
+| `GET` | `/api/v1/reconciliation/report` | State counts and balance check |
+| `GET` | `/api/v1/reconciliation/lines` | Transactions behind a total |
+| `GET` | `/api/v1/pricing-rules` | The tenant's rules |
+| `GET` | `/api/v1/pricing-rules/{id}` | One rule, to verify an amount |
+| `GET` | `/actuator/health` | Liveness and readiness |
+
+### Contract extensions
+
+Two changes to the contract in the brief, both **additive and backward compatible**:
+
+1. `quantity` and `currency` accepted at the top level, with `metadata.quantity` as a
+   fallback. A producer using the original shape keeps working unchanged.
+2. Unknown fields are ignored, so upstream can add fields without a coordinated deployment.
+
+**`X-Tenant-Id` is required**, which *is* breaking for a client that only sent `tenantId` in
+the body. Deliberate: the brief states the payload is not sufficient. Migration is one header.
+
+---
+
+## Testing
+
+| Level | Tool | Scope |
+| --- | --- | --- |
+| Unit | JUnit 5 + MockK | Rating, rounding, effective dating, period boundaries. No Spring |
+| Persistence | Testcontainers | Constraints, RLS, migrations |
+| Web slice | `@WebMvcTest` | Contracts and status codes |
+| Full context | `@SpringBootTest` | AOP, transactions, outbox, concurrency |
+
+Integration tests are tagged `integration` and excluded from `./gradlew test`, so the
+**coverage gate measures unit-test coverage only** — a full-context test would otherwise
+inflate it with code that was merely touched rather than verified.
+
+The four behaviours the brief names explicitly:
+
+- **AOP applies** — and self-invocation demonstrably bypasses it, with RLS still blocking
+  the data.
+- **Rollback** — a failure leaves no event behind, while the `REQUIRES_NEW` rejection record
+  survives.
+- **Idempotency** — ten concurrent threads on one event id; four concurrent workers on
+  twenty events; exactly one charge each time.
+- **Tenant isolation** — at the aspect, at the repository, and at the database, including a
+  deliberately unfiltered query that returns nothing.
+
 ### Coverage gate
 
-`check` depends on `jacocoTestCoverageVerification`, which fails the build below **85%
-line coverage** measured on **unit tests only**. Integration tests are deliberately
-excluded from the measurement so that coverage cannot be inflated by starting a full
-application context and touching code incidentally.
-
-The gate was verified in both directions: it fails when production code is uncovered,
-and passes once it is covered.
+`check` depends on `jacocoTestCoverageVerification`, which fails below **85% line coverage**.
+Verified in both directions: it fails when production code is uncovered and passes when it
+is covered.
 
 **Exclusions**, limited to framework bootstrap and pure wiring:
 
@@ -57,68 +440,99 @@ and passes once it is covered.
 
 Domain, service, rating, tenancy and reconciliation code are all inside the gate.
 
-## Architecture
-
-The design document behind this implementation covers the data model, transaction
-boundaries, asynchronous processing, idempotency, tenant isolation and the
-late-arrival policy in full. Summary:
-
-| Concern | Decision |
-| --- | --- |
-| Async coordination | Outbox table in Postgres, workers polling with `FOR UPDATE SKIP LOCKED` |
-| Idempotency | `UNIQUE (tenant_id, event_id)`; insert-and-catch, never read-then-write |
-| Tenant isolation | `X-Tenant-Id` header → `TenantContext` → `@RequiresTenant` aspect → Postgres RLS |
-| Late arrival | Closed periods stay immutable; late events bill as an adjustment in the open period |
-| Pricing | Effective-dated rules, `[from, to)`, non-overlap enforced by a Postgres `EXCLUDE` constraint |
-
-### Module layout
-
-```
-com.revenium.usage
-├─ ingestion       # accepting transactions, idempotency, raw event persistence
-├─ rating          # applying pricing rules, monetary calculation
-├─ pricing         # effective-dated pricing rules
-├─ invoicing       # billing periods, summaries, period close
-├─ reconciliation  # processing states, reports, traceability
-├─ tenancy         # TenantContext, @RequiresTenant, aspect, RLS plumbing
-├─ processing      # outbox, worker, retries, dead letters
-└─ shared          # cross-cutting: domain primitives, errors, configuration
-```
-
-Each module is layered `api → application → domain`, with `infrastructure → domain`.
-The `domain` layer depends on nothing else in the project.
+---
 
 ## Configuration
 
-Everything is environment-overridable; defaults in `application.yml` are for local
-development only. No credentials are committed.
+Everything is environment-overridable; defaults are for local development only. No
+credentials are committed.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DB_URL` | `jdbc:postgresql://localhost:5432/usage_rating` | Application datasource |
-| `DB_USER` / `DB_PASSWORD` | `usage_app` | Application role — **no `BYPASSRLS`** |
-| `DB_MIGRATION_USER` / `DB_MIGRATION_PASSWORD` | falls back to `DB_USER` | Liquibase role (table owner) |
+| `DB_USER` / `DB_PASSWORD` | `usage_app` | Runtime role — **no `BYPASSRLS`, owns nothing** |
+| `DB_MIGRATION_USER` / `DB_MIGRATION_PASSWORD` | falls back to `DB_USER` | Liquibase role (owner) |
 | `BILLING_LATE_ARRIVAL_MAX_AGE` | `P90D` | Beyond this, late events are quarantined |
 | `OUTBOX_POLL_INTERVAL` | `1000ms` | Worker poll cadence |
-| `OUTBOX_MAX_ATTEMPTS` | `5` | Attempts before a message is dead-lettered |
+| `OUTBOX_MAX_ATTEMPTS` | `5` | Attempts before dead-lettering |
 
-The application and the migrations connect as **different roles by design**: a table
-owner bypasses row-level security in Postgres, so the runtime role must not be the owner.
+Graceful shutdown is enabled: on `SIGTERM` the worker stops claiming new work and finishes
+its current batch. Unclaimed work stays `PENDING`; claimed-but-unfinished work is reclaimed
+by another instance after the stale-claim timeout.
 
-## Technology
+---
 
-Kotlin 2.4.20 · Spring Boot 4.1.1 · PostgreSQL 16 · Liquibase · Gradle 8.14.4 (Kotlin
-DSL, wrapper committed) · JUnit 5 · MockK · Testcontainers · JaCoCo
+## Assumptions and scope
 
-## Implementation status
+Simplified, as the brief permits:
 
-- [x] Gradle build, version catalog, coverage gate (verified failing and passing)
-- [x] Module layout and layering rules
-- [x] Configuration, Docker, Compose, Postgres roles for RLS
-- [ ] Liquibase schema and seed pricing rules
-- [ ] Ingestion, idempotency
-- [ ] Tenancy: context, aspect, RLS policies
-- [ ] Rating and the outbox worker
-- [ ] Invoicing and late-arrival handling
-- [ ] Reconciliation reporting
-- [ ] Full test suite and API documentation
+- **Authentication.** No login or JWT; the tenant arrives in a header assumed to be set by
+  an authenticating gateway. The extension point is one class.
+- **Customer management.** `customerId` is an opaque string. No catalogue, no validation.
+- **Invoice lifecycle.** Two states, `OPEN` and `CLOSED`, closed by an administrative
+  endpoint rather than a scheduler so the behaviour is demonstrable. No issuing, payment,
+  credit notes or tax.
+- **Pricing.** Per-unit price by `(tenant, transactionCode)`. No tiers, minimums, caps or
+  volume discounts — the model leaves room for them without a destructive migration.
+  Pricing is read-only over the API; price changes are an administrative operation.
+- **Currency.** One currency per pricing rule, no FX conversion.
+- **JPA annotations on domain entities.** A pragmatic exception to keeping the domain
+  framework-free: a parallel set of persistence classes plus mappers would cost more than it
+  buys at this size.
+
+Not sacrificed: no double billing, every amount explainable, no cross-tenant access,
+append-only history, decimal arithmetic with explicit rounding.
+
+### Open questions
+
+- **`200` vs `409` for duplicates** — argued above, but a reviewer may reasonably prefer
+  `409`. It is a one-line change.
+- **Period close** is manual. A scheduled close is more realistic; an endpoint is more
+  demonstrable.
+- **Multi-currency customers.** A customer whose transaction codes are priced in different
+  currencies would need per-currency invoice lines. Out of scope, and the schema would need
+  a change to support it honestly.
+
+---
+
+## Notes from building this
+
+A few findings that cost real time and are worth knowing:
+
+- **Spring Boot 4 uses Jackson 3** (`tools.jackson`), so `com.fasterxml…ObjectMapper` is not
+  a bean. `spring-boot-starter-aop` no longer exists (it is `starter-aspectj`), Liquibase
+  autoconfiguration moved to a separate `spring-boot-liquibase` module — without it
+  migrations are **silently skipped** — and `TestRestTemplate` moved packages.
+- **`@DynamicPropertySource` is ignored on an `@Import`ed `@TestConfiguration`.** It only
+  works on the test class itself. Declared elsewhere it fails silently and surfaces much
+  later as an authentication error.
+- **PostgreSQL does not round-trip `NULL` through `set_config`**: writing `NULL` yields an
+  **empty string**, and only a never-written setting reads back as `NULL`. Policies written
+  against `IS NULL` stop matching once the setting is cleared.
+- **Liquibase's `valueDate` discards the timezone offset** and stores the local-time
+  equivalent. On a UTC−5 machine a seeded price changeover landed at 05:00 UTC instead of
+  midnight — five hours of events billed at the wrong price, invisible in the seed file and
+  caught only by asserting on a boundary event. Seeds now use explicit `TIMESTAMPTZ` literals.
+
+Three defects only appeared when the finished service was exercised through Docker
+Compose rather than through tests, all from one scenario — **closing the period that is
+still in progress**:
+
+- **The late adjustment had nowhere to go.** "The open period" was taken to mean the one
+  containing *now*, which in this scenario was the period just closed. The adjustment was
+  assigned the same period as its origin, the `CHECK` requiring them to differ rejected
+  the insert, and the charge was lost. The search now walks forward to the first period
+  that is genuinely open.
+- **The worker reported success for a write that never happened.** Every
+  `DataIntegrityViolationException` was treated as a lost concurrency race, so the failed
+  insert above was recorded as `DONE`: an accepted event, silently never billed, with
+  nothing explaining why. Only a violation naming the current-rating unique index is a
+  race now; anything else propagates and retries.
+- **The reconciliation report could never balance for an adjustment.** It counted events
+  by `occurred_at` but charges by `billing_period` — two different periods for the same
+  transaction, so one side always came up short. The report now counts charges by
+  `origin_period`, which is the same instant as `occurred_at`. `/lines` still uses
+  `billing_period`, because tracing an invoice figure is a different question.
+
+None of these were reachable from the unit tests, and only the first was reachable from
+the integration suite as originally written. All three now have regression tests.

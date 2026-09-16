@@ -120,10 +120,14 @@ class RatingCalculator(
             currency = rule.currencyAsCurrency(),
         )
 
-        // A closed invoice is never reopened. The charge lands in the open period as an
-        // adjustment, and origin_period keeps the link to when the usage really happened.
+        // A closed invoice is never reopened. The charge lands in the next period that is
+        // still open, and origin_period keeps the link to when the usage really happened.
         val isLate = isPeriodClosed(originPeriod)
-        val billingPeriod = if (isLate) openPeriodFor(now) else originPeriod
+        val billingPeriod = if (isLate) {
+            nextOpenPeriodAfter(originPeriod, now, isPeriodClosed)
+        } else {
+            originPeriod
+        }
 
         return RatingOutcome.Rated(
             rule = rule,
@@ -135,11 +139,42 @@ class RatingCalculator(
     }
 
     /**
-     * The period a late adjustment is charged in: the one containing "now".
+     * The period a late adjustment is charged in: the first one after [originPeriod] that
+     * is still open.
      *
-     * Not `originPeriod.next()`, which could itself be closed — an event from January
-     * arriving in September would otherwise land in a February invoice that was closed
-     * months ago.
+     * Starting from the current period is not enough. An operator may close the period
+     * that is currently in progress, and the adjustment would then be assigned to that
+     * same closed period — which both contradicts the policy and violates the database
+     * CHECK requiring a late adjustment's two periods to differ. It failed exactly that
+     * way the first time a closed current period was exercised end to end.
+     *
+     * Nor is `originPeriod.next()` enough on its own: a January event arriving in
+     * September would land in a February invoice that closed months ago. So the search
+     * walks forward from whichever is later — the period after the origin, or the current
+     * one — until it finds a period that is open.
+     *
+     * [MAX_LOOKAHEAD] bounds the walk. Reaching it means every period for two years is
+     * closed, which is a configuration problem rather than something to loop over
+     * forever; the last candidate is returned and the database CHECK still guarantees the
+     * two periods differ.
      */
-    private fun openPeriodFor(now: Instant): BillingPeriod = BillingPeriod.of(now)
+    private fun nextOpenPeriodAfter(
+        originPeriod: BillingPeriod,
+        now: Instant,
+        isPeriodClosed: (BillingPeriod) -> Boolean,
+    ): BillingPeriod {
+        val currentPeriod = BillingPeriod.of(now)
+        var candidate = maxOf(originPeriod.next(), currentPeriod)
+
+        repeat(MAX_LOOKAHEAD) {
+            if (!isPeriodClosed(candidate)) return candidate
+            candidate = candidate.next()
+        }
+        return candidate
+    }
+
+    private companion object {
+        /** Two years of monthly periods: far past any plausible run of closed months. */
+        const val MAX_LOOKAHEAD = 24
+    }
 }

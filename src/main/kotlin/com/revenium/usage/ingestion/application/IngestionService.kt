@@ -180,6 +180,11 @@ class DuplicateResolver(
                 "Unique violation for event ${transaction.eventId} but no existing row found"
             )
 
+        // Counted even when the bodies match: an identical re-delivery writes nothing
+        // else, so without this tally it would be invisible to reconciliation.
+        existing.recordDuplicateDelivery(clock.instant())
+        rawEvents.save(existing)
+
         val payloadDiffers = existing.payloadHash != transaction.payloadHash
         if (payloadDiffers) {
             // Same id, different body: an upstream bug. The first delivery wins so we
