@@ -24,8 +24,15 @@ spring:
 
   liquibase:
     change-log: classpath:db/changelog/db.changelog-master.yaml
-    # Migrations run as the owner role, which is allowed to bypass RLS.
-    # The application itself connects as a non-privileged role (see README).
+    # Migrations run on their OWN connection as the owner role, which creates the
+    # extensions, tables and the runtime role itself. Setting only user/password would
+    # reuse the application DataSource, which cannot connect until `usage_app` exists --
+    # a chicken-and-egg failure at startup.
+    #
+    # The application connects as `usage_app`, which has no BYPASSRLS and owns nothing,
+    # so row-level security actually applies to it. A superuser or an owner bypasses
+    # policies unconditionally, even with FORCE ROW LEVEL SECURITY.
+    url: ${DB_MIGRATION_URL:${DB_URL:jdbc:postgresql://localhost:5432/usage_rating}}
     user: ${DB_MIGRATION_USER:${DB_USER:usage_app}}
     password: ${DB_MIGRATION_PASSWORD:${DB_PASSWORD:usage_app}}
 

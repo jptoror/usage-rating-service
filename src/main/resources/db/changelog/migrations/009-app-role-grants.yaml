@@ -1,0 +1,33 @@
+databaseChangeLog:
+
+  # ---------------------------------------------------------------------------
+  # Privileges for the runtime role.
+  #
+  # Runs last, after every table exists: a GRANT ON ALL TABLES only covers tables
+  # that are present when it executes, so granting earlier would silently miss
+  # anything a later changeset creates.
+  #
+  # The role itself is created by the environment (docker/postgres-init in Compose,
+  # the container init script under Testcontainers) rather than here. It has to
+  # exist before the application opens its first connection, and that happens while
+  # Hibernate builds the EntityManagerFactory -- before any migration has run.
+  #
+  # Guarded on the role existing so the migration is a no-op where something else
+  # manages roles.
+  # ---------------------------------------------------------------------------
+  - changeSet:
+      id: 009-01-grant-app-role
+      author: jptoro
+      changes:
+        - sql:
+            splitStatements: false
+            sql: |
+              DO $$
+              BEGIN
+                  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'usage_app') THEN
+                      EXECUTE 'GRANT USAGE ON SCHEMA public TO usage_app';
+                      EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO usage_app';
+                      EXECUTE 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO usage_app';
+                  END IF;
+              END $$;
+            rollback: SELECT 1
