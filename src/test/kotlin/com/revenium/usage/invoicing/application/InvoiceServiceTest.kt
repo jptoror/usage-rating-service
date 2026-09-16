@@ -5,8 +5,8 @@ import com.revenium.usage.invoicing.domain.InvoiceLine
 import com.revenium.usage.invoicing.domain.InvoiceStatus
 import com.revenium.usage.invoicing.infrastructure.InvoiceJpaRepository
 import com.revenium.usage.invoicing.infrastructure.InvoiceLineJpaRepository
-import com.revenium.usage.rating.domain.RatedTransaction
-import com.revenium.usage.rating.infrastructure.RatedTransactionRepository
+import com.revenium.usage.invoicing.domain.Charge
+import com.revenium.usage.invoicing.domain.ChargeLookup
 import com.revenium.usage.shared.domain.BillingPeriod
 import com.revenium.usage.shared.domain.CustomerId
 import com.revenium.usage.tenancy.MissingTenantException
@@ -37,7 +37,9 @@ class InvoiceServiceTest {
     private val september = BillingPeriod.parse("2026-09")
     private val august = BillingPeriod.parse("2026-08")
 
-    private val ratedTransactions = mockk<RatedTransactionRepository>()
+    // A read-only port, not rating's JPA repository: invoicing has no business
+    // holding save/delete on the financial ledger.
+    private val charges = mockk<ChargeLookup>()
     private val invoices = mockk<InvoiceJpaRepository> {
         every { save(any()) } answers { firstArg() }
     }
@@ -46,7 +48,7 @@ class InvoiceServiceTest {
     }
 
     private val service = InvoiceService(
-        ratedTransactions = ratedTransactions,
+        charges = charges,
         invoices = invoices,
         invoiceLines = invoiceLines,
         defaultCurrency = usd,
@@ -62,18 +64,12 @@ class InvoiceServiceTest {
         quantity: String = "2",
         originPeriod: BillingPeriod = september,
         isLate: Boolean = false,
-    ) = RatedTransaction(
-        tenantId = tenant.value,
-        rawEventId = 1L,
-        customerId = customer.value,
+        currency: String = "USD",
+    ) = Charge(
         transactionCode = code,
-        pricingRuleId = 1L,
-        unitPrice = BigDecimal("2.500000"),
         quantity = BigDecimal(quantity),
         amount = BigDecimal(amount),
-        currency = "USD",
-        occurredAt = now,
-        billingPeriod = september.startDate,
+        currency = currency,
         originPeriod = originPeriod.startDate,
         isLateAdjustment = isLate,
     )
@@ -81,8 +77,8 @@ class InvoiceServiceTest {
     private fun noInvoiceYet() =
         every { invoices.findByTenantIdAndCustomerIdAndPeriodStart(any(), any(), any()) } returns null
 
-    private fun rating(vararg rows: RatedTransaction) =
-        every { ratedTransactions.findCurrentForBillingPeriod(any(), any(), any()) } returns rows.toList()
+    private fun rating(vararg rows: Charge) =
+        every { charges.findChargesFor(any(), any(), any()) } returns rows.toList()
 
     // --- summarising an open period ----------------------------------------
 
@@ -145,14 +141,7 @@ class InvoiceServiceTest {
     @Test
     fun `takes the currency from the transactions themselves`() {
         noInvoiceYet()
-        val eurRow = RatedTransaction(
-            tenantId = tenant.value, rawEventId = 1L, customerId = customer.value,
-            transactionCode = "CODE", pricingRuleId = 1L,
-            unitPrice = BigDecimal("3.750000"), quantity = BigDecimal("2"),
-            amount = BigDecimal("7.5000"), currency = "EUR", occurredAt = now,
-            billingPeriod = september.startDate, originPeriod = september.startDate,
-        )
-        rating(eurRow)
+        rating(rated(code = "CODE", amount = "7.5000", currency = "EUR"))
 
         val summary = TenantContext.runAs(tenant) { service.summarise(customer, september) }
 
@@ -260,13 +249,11 @@ class InvoiceServiceTest {
     @Test
     fun `scopes the query to the tenant in scope`() {
         noInvoiceYet()
-        val queriedTenant = slot<String>()
-        every {
-            ratedTransactions.findCurrentForBillingPeriod(capture(queriedTenant), any(), any())
-        } returns emptyList()
+        val queriedTenant = slot<TenantId>()
+        every { charges.findChargesFor(capture(queriedTenant), any(), any()) } returns emptyList()
 
         TenantContext.runAs(TenantId("tenant-b")) { service.summarise(customer, september) }
 
-        assertEquals("tenant-b", queriedTenant.captured)
+        assertEquals("tenant-b", queriedTenant.captured.value)
     }
 }

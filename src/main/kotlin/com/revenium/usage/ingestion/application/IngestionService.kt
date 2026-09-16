@@ -14,8 +14,7 @@ import com.revenium.usage.shared.domain.EventId
 import com.revenium.usage.ingestion.infrastructure.EventConflictRepository
 import com.revenium.usage.ingestion.infrastructure.RawEventRepository
 import com.revenium.usage.ingestion.infrastructure.RejectedEventRepository
-import com.revenium.usage.processing.domain.OutboxMessage
-import com.revenium.usage.processing.infrastructure.OutboxMessageRepository
+import com.revenium.usage.ingestion.domain.RatingQueue
 import com.revenium.usage.tenancy.RequiresTenant
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
@@ -125,7 +124,7 @@ class IngestionService(
 @Service
 class EventRecorder(
     private val rawEvents: RawEventRepository,
-    private val outbox: OutboxMessageRepository,
+    private val ratingQueue: RatingQueue,
     private val clock: Clock,
 ) {
 
@@ -147,7 +146,7 @@ class EventRecorder(
         // this transaction, rather than at commit time where the caller could no longer
         // distinguish a duplicate from a genuine failure.
         val saved = rawEvents.saveAndFlush(entity)
-        outbox.save(OutboxMessage(tenantId = tenant.value, rawEventId = saved.id))
+        ratingQueue.enqueue(tenant, saved.id)
 
         log.debug { "Accepted event ${transaction.eventId} for tenant $tenant" }
         return IngestionResult.Accepted(transaction.eventId, saved.id, saved.receivedAt)

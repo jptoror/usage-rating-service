@@ -9,8 +9,7 @@ import com.revenium.usage.ingestion.domain.TransactionValidator
 import com.revenium.usage.ingestion.infrastructure.EventConflictRepository
 import com.revenium.usage.ingestion.infrastructure.RawEventRepository
 import com.revenium.usage.ingestion.infrastructure.RejectedEventRepository
-import com.revenium.usage.processing.domain.OutboxMessage
-import com.revenium.usage.processing.infrastructure.OutboxMessageRepository
+import com.revenium.usage.ingestion.domain.RatingQueue
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
 import io.mockk.every
@@ -47,9 +46,9 @@ class IngestionServiceTest {
     // Stubbed explicitly rather than relaxed: a relaxed mock of a generic repository
     // returns a bare Object from save(), which fails with a ClassCastException only
     // once the call is actually exercised.
-    private val outbox = mockk<OutboxMessageRepository> {
-        every { save(any()) } answers { firstArg() }
-    }
+    // The port ingestion owns, not the outbox's repository: ingestion states what it
+    // needs (enqueue for rating) and processing supplies it.
+    private val ratingQueue = mockk<RatingQueue>(relaxed = true)
     private val conflicts = mockk<EventConflictRepository> {
         every { save(any()) } answers { firstArg() }
     }
@@ -60,7 +59,7 @@ class IngestionServiceTest {
 
     private val service = IngestionService(
         validator = TransactionValidator(clock, java.time.Duration.ofMinutes(5)),
-        eventRecorder = EventRecorder(rawEvents, outbox, clock),
+        eventRecorder = EventRecorder(rawEvents, ratingQueue, clock),
         duplicateResolver = DuplicateResolver(rawEvents, conflicts, clock),
         rejectionRecorder = RejectionRecorder(rejectedEvents, objectMapper, clock),
         clock = clock,
@@ -114,10 +113,9 @@ class IngestionServiceTest {
 
         // The outbox row must reference the event that was just persisted: the two
         // writes are the unit that makes the outbox pattern work.
-        val queued = slot<OutboxMessage>()
-        verify(exactly = 1) { outbox.save(capture(queued)) }
-        assertEquals(42L, queued.captured.rawEventId)
-        assertEquals(tenant.value, queued.captured.tenantId)
+        val queuedEventId = slot<Long>()
+        verify(exactly = 1) { ratingQueue.enqueue(tenant, capture(queuedEventId)) }
+        assertEquals(42L, queuedEventId.captured)
     }
 
     @Test
@@ -167,7 +165,7 @@ class IngestionServiceTest {
 
         asTenant { service.ingest(input()) }
 
-        verify(exactly = 0) { outbox.save(any()) }
+        verify(exactly = 0) { ratingQueue.enqueue(any(), any()) }
     }
 
     @Test
@@ -216,7 +214,7 @@ class IngestionServiceTest {
 
         assertIs<IngestionResult.Rejected>(result)
         verify(exactly = 0) { rawEvents.saveAndFlush(any()) }
-        verify(exactly = 0) { outbox.save(any()) }
+        verify(exactly = 0) { ratingQueue.enqueue(any(), any()) }
     }
 
     @Test

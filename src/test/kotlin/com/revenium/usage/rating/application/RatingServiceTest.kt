@@ -3,7 +3,7 @@ package com.revenium.usage.rating.application
 import com.revenium.usage.invoicing.domain.BillingPeriodStatusLookup
 import com.revenium.usage.pricing.domain.PricingRule
 import com.revenium.usage.pricing.domain.PricingRuleLookup
-import com.revenium.usage.processing.infrastructure.ClaimedWork
+import com.revenium.usage.rating.domain.RateableTransaction
 import com.revenium.usage.rating.domain.RatedTransaction
 import com.revenium.usage.rating.domain.RatingCalculator
 import com.revenium.usage.rating.domain.RatingOutcome
@@ -68,8 +68,7 @@ class RatingServiceTest {
     @AfterEach
     fun cleanUp() = TenantContext.clear()
 
-    private fun work(tenantId: String = "tenant-a") = ClaimedWork(
-        outboxId = 1L,
+    private fun work(tenantId: String = "tenant-a") = RateableTransaction(
         tenantId = tenantId,
         rawEventId = 1L,
         customerId = "customer-42",
@@ -77,7 +76,6 @@ class RatingServiceTest {
         occurredAt = Instant.parse("2026-08-15T14:22:31Z"),
         receivedAt = Instant.parse("2026-08-15T14:25:00Z"),
         quantity = BigDecimal("2"),
-        attemptCount = 0,
     )
 
     private fun notYetRated() = every { ratedTransactions.findCurrentByRawEventId(any(), any()) } returns null

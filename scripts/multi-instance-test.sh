@@ -150,6 +150,9 @@ DISTRIBUTION=$(psql_query "
     WHERE e.customer_id = '$CUSTOMER' AND o.processed_by IS NOT NULL
     GROUP BY o.processed_by ORDER BY count(*) DESC;
 ")
+# psql echoes "SET" for the tenant statement; drop it so it neither appears in the
+# evidence nor counts as an instance.
+DISTRIBUTION=$(printf '%s' "$DISTRIBUTION" | grep ':' || true)
 INSTANCES_USED=$(printf '%s' "$DISTRIBUTION" | grep -c ':' || echo 0)
 
 printf '%s\n' "$DISTRIBUTION" | while read -r line; do [ -n "$line" ] && info "$line"; done
