@@ -9,6 +9,9 @@ outbox batch · **R** = pricing rules for one `(tenant, code)` · **W** = worker
 
 ## Summary
 
+Throughput figures below are **measured**, not estimated — see
+[performance.md](performance.md) for the method and the hardware.
+
 | Operation | Time | Queries | Allocations | Limit reached at |
 | --- | --- | --- | --- | --- |
 | Ingest one transaction | O(1) | 2 writes | O(1) | write throughput |
@@ -88,18 +91,31 @@ ever and are the vast majority, so a full index would grow without bound while t
 useful portion stayed small. The partial index stays proportional to the queue, not to
 history.
 
-**How this scales with W.** `SKIP LOCKED` means workers never block on each other, so
-adding instances adds throughput — up to the point where the claim query itself becomes
-the contention point. Each worker issues one claim per poll interval, so the database
-sees `W / pollInterval` claim queries per second: three instances at 200 ms is 15/s,
-which is nothing. At W = 50 it is 250/s of a query that locks rows, and the marginal
-instance starts costing more than it contributes.
+**How this scales with W — measured.** `SKIP LOCKED` means workers never block on each
+other, so adding instances adds throughput **until the database becomes the constraint**,
+which happens sooner than the claim query's own cost would suggest.
 
-**The realistic ceiling** is not the claim but the per-message work: two reads and a
-write each, so roughly `M × 3` round trips per batch. At 50 messages per batch and ~1 ms
-per round trip, a worker sustains on the order of a few hundred messages per second.
-Three instances handle roughly 1,000/s, which is far beyond what an integration of this
-shape produces.
+On this hardware, three tuned instances reached 255 events/s against 228 for one — a 12%
+gain for 3× the compute. Ingestion throughput fell at the same time (329 → 263 ev/s),
+which is the signature of contention on a shared PostgreSQL rather than on the claim.
+
+The claim query itself is not the problem at this scale: `W / pollInterval` is 15
+queries/s for three instances at 200 ms. The write path is.
+
+**The real ceiling is the poll interval, not the work.** This was measured rather than
+reasoned about, and the reasoning was wrong: the estimate here previously said "a few
+hundred messages per second per worker", and a single instance at the default settings
+actually sustains **36 events/s**.
+
+The arithmetic is simple once measured: one batch of 50 per poll, one poll per second,
+so 50/s is the design ceiling regardless of how fast the database is. The workers were
+idle, not saturated.
+
+**The defaults changed as a result** — 200 ms and 200 per batch, raising the ceiling from
+50/s to ~1,000/s. A configuration value was the constraint, and no amount of database or
+JVM tuning would have found it.
+
+Measured figures and the full analysis are in [performance.md](performance.md).
 
 ---
 
@@ -215,9 +231,12 @@ In order:
    queries fast, but the table grows without bound. Fix: archive `DONE` rows older than
    the retention window. Not urgent — the rows are small — but it is unbounded, which
    eventually matters.
-4. **Worker throughput**, at roughly 1,000 messages/second across three instances. Fix:
-   more instances, then batch the rating writes, then Debezium onto Kafka without
-   touching the domain.
+4. **The shared database**, at roughly **250 events/s** on this hardware — reached by a
+   single tuned instance, with three instances adding only 12%. The application is no
+   longer the constraint at that point. Fix, in order: tune the poll interval and batch
+   size (free, 6.3× measured), then database capacity, and only then more instances or a
+   broker. The original estimate of "a few hundred per instance" was wrong twice over:
+   the ceiling was configuration, and then it was the database.
 
 None of these is reached by the volumes this exercise describes. They are written down
 because "it scales" is not a claim worth making without naming the point where it stops.

@@ -23,8 +23,15 @@ private val log = KotlinLogging.logger {}
 
 @ConfigurationProperties("outbox")
 data class OutboxProperties(
-    val pollInterval: Duration = Duration.ofSeconds(1),
-    val batchSize: Int = 50,
+    /**
+     * How often a worker asks for work.
+     *
+     * This, not per-message cost, is what bounds rating throughput: `batchSize /
+     * pollInterval` is a hard ceiling. At the original 1s it was 50 events/s and the
+     * workers were idle rather than saturated. See docs/analysis/performance.md.
+     */
+    val pollInterval: Duration = Duration.ofMillis(200),
+    val batchSize: Int = 200,
     val maxAttempts: Int = 5,
     val backoffBase: Duration = Duration.ofSeconds(10),
     /** Missing pricing rules retry on this slower cadence, indefinitely. */

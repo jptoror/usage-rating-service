@@ -78,9 +78,28 @@ class OutboxWorkerIntegrationTest(
         return assertIs<IngestionResult.Accepted>(result).rawEventId
     }
 
-    /** Polls until the queue stops yielding work, so a test never depends on batch size. */
-    private fun drain(maxCycles: Int = 10) {
-        repeat(maxCycles) { if (worker.pollOnce() == 0) return }
+    /**
+     * Polls until no message is left in a non-terminal state.
+     *
+     * Not "until pollOnce returns 0": that reports how many messages were CLAIMED, and a
+     * claimed message is still in flight. A single poll is also not enough — with
+     * contention a worker can come back empty while another holds the rows. Both
+     * shortcuts produced tests that passed alone and failed in the suite.
+     */
+    private fun drain(maxCycles: Int = 30) {
+        repeat(maxCycles) {
+            worker.pollOnce()
+            val outstanding = TenantContext.runAs(tenantA) {
+                jdbc.queryForObject(
+                    """
+                    SELECT count(*) FROM outbox_message
+                    WHERE status NOT IN ('DONE','UNRATED','QUARANTINED','FAILED')
+                    """,
+                    Long::class.java,
+                ) ?: 0
+            }
+            if (outstanding == 0L) return
+        }
     }
 
     // --- the happy path ----------------------------------------------------
@@ -89,7 +108,7 @@ class OutboxWorkerIntegrationTest(
     fun `rates a queued event and marks the message done`() {
         val rawEventId = ingest()
 
-        assertEquals(1, worker.pollOnce())
+        drain()
 
         TenantContext.runAs(tenantA) {
             val rated = assertNotNull(ratedTransactions.findCurrentByRawEventId(tenantA.value, rawEventId))
@@ -226,13 +245,25 @@ class OutboxWorkerIntegrationTest(
             val futures = (1..workers).map {
                 executor.submit<Int> {
                     start.await()
-                    // Several cycles each, so they genuinely contend rather than one
-                    // worker happening to drain the queue before the others wake.
-                    (1..5).sumOf { worker.pollOnce() }
+                    // Polls until the queue is drained rather than a fixed number of
+                    // cycles: with a large batch size one worker can take everything in
+                    // a single claim, and with contention a worker can come back empty
+                    // several times while another holds the rows. A fixed count made the
+                    // test depend on batch size, which is configuration.
+                    var claimed = 0
+                    repeat(40) {
+                        val n = worker.pollOnce()
+                        claimed += n
+                        if (n == 0 && claimed > 0) return@submit claimed
+                    }
+                    claimed
                 }
             }
             start.countDown()
             futures.forEach { it.get(60, TimeUnit.SECONDS) }
+
+            // Every worker has stopped claiming; drain any straggler still PROCESSING.
+            repeat(10) { if (worker.pollOnce() == 0) return@repeat }
 
             TenantContext.runAs(tenantA) {
                 // 20 events in, 20 charges out. Not 21, not 19.
@@ -265,7 +296,7 @@ class OutboxWorkerIntegrationTest(
     @Test
     fun `an unrated event is rated once its pricing rule appears`() {
         val rawEventId = ingest(code = "LATE_CODE")
-        worker.pollOnce()
+        drain()
 
         TenantContext.runAs(tenantA) {
             assertEquals(
@@ -281,13 +312,13 @@ class OutboxWorkerIntegrationTest(
             jdbc.update(
                 """
                 INSERT INTO pricing_rule (tenant_id, transaction_code, unit_price, currency, effective_from)
-                VALUES ('tenant-a', 'LATE_CODE', 1.500000, 'USD', '2026-01-01T00:00:00Z')
+                VALUES ('tenant-a', 'LATE_CODE', 1.500000, 'USD', TIMESTAMPTZ '2026-01-01 00:00:00+00')
                 """
             )
             jdbc.update("UPDATE outbox_message SET next_attempt_at = now() WHERE raw_event_id = ?", rawEventId)
         }
 
-        worker.pollOnce()
+        drain()
 
         TenantContext.runAs(tenantA) {
             val rated = assertNotNull(ratedTransactions.findCurrentByRawEventId(tenantA.value, rawEventId))

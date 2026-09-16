@@ -14,9 +14,8 @@ services:
     # Replaces the single-instance mapping: with --scale, a fixed host port collides.
     ports: !override []
     environment:
-      # A short poll interval makes the instances genuinely contend for work during a
-      # test run, instead of one draining the queue before the others wake up.
-      OUTBOX_POLL_INTERVAL: 200ms
+      # Inherited from the base compose file (200ms) -- not overridden here, so a
+      # scaled run and a single-instance run differ in ONE variable: the instance count.
       # The instance identifier is the container hostname, which Compose makes unique
       # per replica. The application reads it and stamps it on every message it
       # claims, so the evidence shows WHICH instance did what -- not merely that the
