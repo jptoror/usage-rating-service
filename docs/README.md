@@ -6,6 +6,7 @@
 | [Sequence diagrams](diagrams/sequences.md) | One per operation, with transaction boundaries marked |
 | [Manual testing](manual-testing.md) | Walking through the service by hand, and what each scenario proves |
 | [Complexity analysis](analysis/complexity.md) | Big-O per operation, where the limits are, what would break first |
+| [Performance](analysis/performance.md) | Measured throughput and latency, and what the measurements corrected |
 | [Evidence](evidence/) | Transcripts from actual runs — requests, responses, and per-instance breakdowns |
 
 The [README](../README.md) at the repository root covers build, run, configuration and
@@ -25,6 +26,7 @@ well as by hand.
 | `e2e-test.sh [--evidence]` | 22 checks across all eight functional requirements |
 | `edge-case-test.sh [--evidence]` | Boundaries through the full stack — precision, validation, isolation |
 | `multi-instance-test.sh [--evidence]` | Coordination across separate processes under real contention |
+| `load-test.sh [--events N] [--evidence]` | Throughput, latency percentiles, and whether instances actually help |
 
 `--evidence` writes a timestamped transcript to `evidence/`.
 
@@ -33,6 +35,7 @@ well as by hand.
 ./scripts/e2e-test.sh --evidence
 ./scripts/edge-case-test.sh --evidence
 ./scripts/multi-instance-test.sh --evidence
+./scripts/load-test.sh --events 3000 --concurrency 50 --evidence
 ./scripts/stop.sh --clean
 ```
 
@@ -40,7 +43,7 @@ well as by hand.
 
 ## Why the scripts exist alongside the test suite
 
-The automated suite (309 tests, 92% line coverage) runs against Testcontainers and
+The automated suite (314 tests, 90.7% line coverage) runs against Testcontainers and
 covers the domain thoroughly. The scripts cover what it structurally cannot:
 
 - **The wire.** A scale lost in JSON, a timezone applied by a driver, a numeric column
@@ -55,3 +58,8 @@ covers the domain thoroughly. The scripts cover what it structurally cannot:
 
 Three defects reached the finished service and were found only by running it — all
 listed in the root README under "Notes from building this."
+
+Measuring rather than estimating corrected a fourth thing: the complexity analysis had
+claimed a worker sustains "a few hundred messages per second", reasoning from per-message
+cost. It sustains 36, because the limit is `batchSize / pollInterval` and the worker was
+idle most of the time. The defaults changed as a result.

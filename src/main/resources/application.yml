@@ -82,8 +82,14 @@ billing:
     max-age: ${BILLING_LATE_ARRIVAL_MAX_AGE:P90D}
 
 outbox:
-  poll-interval: ${OUTBOX_POLL_INTERVAL:1000ms}
-  batch-size: ${OUTBOX_BATCH_SIZE:50}
+  # Measured, not guessed. A 1s interval with 50-message batches caps a worker at
+  # 50 events/s regardless of how fast anything else is -- the worker spends most of
+  # its time asleep. Shortening the interval alone gained 3.9x in the load test, which
+  # is more than tripling the instances gained (1.8x). See docs/analysis/performance.md.
+  poll-interval: ${OUTBOX_POLL_INTERVAL:200ms}
+  # 200 per batch at 200ms raises the ceiling to ~1000 events/s without adding round
+  # trips per message: the claim is one query whatever the batch size.
+  batch-size: ${OUTBOX_BATCH_SIZE:200}
   max-attempts: ${OUTBOX_MAX_ATTEMPTS:5}
   # Exponential backoff base; attempt N waits base * 2^(N-1).
   backoff-base: ${OUTBOX_BACKOFF_BASE:PT10S}

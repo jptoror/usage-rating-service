@@ -42,6 +42,7 @@ Java 21 is required: `export JAVA_HOME=$(/usr/libexec/java_home -v 21)`
 | Integration tests | 40 (Testcontainers) |
 | Line coverage | **90.7%** against an 85% gate |
 | Scripted checks | 22 end-to-end + 22 edge cases + 8 multi-instance |
+| Measured throughput | ~330 events/s ingested, 228 events/s rated on **one** tuned instance |
 
 ### Scripts
 
@@ -50,6 +51,7 @@ Java 21 is required: `export JAVA_HOME=$(/usr/libexec/java_home -v 21)`
 ./scripts/e2e-test.sh --evidence    # every functional requirement
 ./scripts/edge-case-test.sh         # boundaries through the full stack
 ./scripts/multi-instance-test.sh    # coordination across separate processes
+./scripts/load-test.sh --events 3000 --concurrency 50   # throughput and latency
 ./scripts/stop.sh --clean
 ```
 
@@ -250,9 +252,13 @@ add a container and several failure modes without adding correctness at this sca
 - **`UNRATED` is not a failure.** A missing pricing rule does not count against the retry
   budget: the rule may be created tomorrow, and the event must still be waiting when it is.
 - **Abandoned claims** are reclaimed after a timeout, so a killed worker loses no work.
-- **Throughput** is on the order of thousands of messages per minute per instance. The
-  migration path, if that were ever insufficient, is to publish the outbox to Kafka with
-  Debezium without touching the domain.
+- **Throughput** was measured, not estimated, and the estimate was wrong twice over. A
+  worker is bounded by `batchSize / pollInterval`, not by per-message cost: at the
+  original 1 s interval that was 50 events/s and the workers were *idle*. Tuning the two
+  values gained **6.3×** on a single instance (36 → 228 ev/s); tripling the instances on
+  top of that gained **12%**, because the constraint had moved to the shared database.
+  The defaults now ship at 200 ms and 200 per batch. Six measured runs, and where the
+  ceiling actually is, in [docs/analysis/performance.md](docs/analysis/performance.md).
 
 ### Idempotency
 

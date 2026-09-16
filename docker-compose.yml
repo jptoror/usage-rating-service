@@ -37,6 +37,16 @@ services:
       DB_MIGRATION_USER: ${POSTGRES_USER:-usage_owner}
       DB_MIGRATION_PASSWORD: ${POSTGRES_PASSWORD:-usage_owner}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Overridable so a load test can isolate the effect of poll cadence from the
+      # effect of adding instances -- different questions with different answers
+      # (see docs/analysis/performance.md).
+      #
+      # The defaults here MUST match application.yml. They did not, once: the compose
+      # file pinned the old 1000ms/50 while the application defaulted to 200ms/200, and
+      # since an environment variable wins over the YAML, a measurement of the "new
+      # defaults" silently measured the old ones.
+      OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-200ms}
+      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-200}
     ports:
       - "${APP_PORT:-8080}:8080"
     restart: unless-stopped
