@@ -4,6 +4,8 @@ Ingests customer usage transactions, rates them under effective-dated pricing ru
 produces invoice summaries, and exposes reconciliation evidence linking every billed
 amount back to the events and pricing rules behind it.
 
+[![Quality gates](https://github.com/jptoror/usage-rating-service/actions/workflows/quality-gates.yml/badge.svg)](https://github.com/jptoror/usage-rating-service/actions/workflows/quality-gates.yml)
+
 Kotlin 2.4 · Spring Boot 4.1 · PostgreSQL 16 · Liquibase · Gradle (Kotlin DSL)
 
 ---
@@ -61,7 +63,12 @@ transcript to [`docs/evidence/`](docs/evidence/).
 ### Documentation
 
 [`docs/`](docs/README.md) holds the architecture and sequence diagrams, a manual
-testing guide, a complexity analysis, and the evidence transcripts.
+testing guide, complexity and performance analyses, the evidence transcripts, and
+[what CI gates on](docs/CI.md).
+
+Every pull request runs the full set of gates: compile, unit tests with the 85% coverage
+gate, integration tests, architecture rules, a Docker end-to-end run, and multi-instance
+coordination under contention.
 
 ---
 
