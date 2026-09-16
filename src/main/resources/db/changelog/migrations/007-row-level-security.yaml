@@ -77,23 +77,3 @@ databaseChangeLog:
                   END IF;
               END $$;
             rollback: DROP ROLE IF EXISTS usage_maintenance
-
-  - changeSet:
-      id: 007-03-grant-app-role
-      author: jptoro
-      comment: >
-        Grants for the runtime role. Guarded because the role is created by the
-        container init script in Compose, and may not exist in every environment
-        (a plain Testcontainers database, for example).
-      changes:
-        - sql:
-            splitStatements: false
-            sql: |
-              DO $$
-              BEGIN
-                  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'usage_app') THEN
-                      EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO usage_app';
-                      EXECUTE 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO usage_app';
-                  END IF;
-              END $$;
-            rollback: SELECT 1
