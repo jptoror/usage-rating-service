@@ -9,6 +9,17 @@ import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import java.time.Duration
 
+@ConfigurationProperties("billing")
+data class BillingProperties(
+    /**
+     * Currency used when a period has no rated transactions to take one from.
+     *
+     * Only reached for an empty period: any transaction carries the currency of the
+     * pricing rule that priced it.
+     */
+    val defaultCurrency: String = "USD",
+)
+
 @ConfigurationProperties("billing.late-arrival")
 data class LateArrivalProperties(
     /**
@@ -20,7 +31,11 @@ data class LateArrivalProperties(
 )
 
 @Configuration
-@EnableConfigurationProperties(OutboxProperties::class, LateArrivalProperties::class)
+@EnableConfigurationProperties(
+    OutboxProperties::class,
+    LateArrivalProperties::class,
+    BillingProperties::class,
+)
 class RatingConfiguration {
 
     /**
@@ -35,4 +50,8 @@ class RatingConfiguration {
         pricingRules: PricingRuleLookup,
         lateArrival: LateArrivalProperties,
     ): RatingCalculator = RatingCalculator(pricingRules, lateArrival.maxAge)
+
+    @Bean
+    fun defaultCurrency(billing: BillingProperties): java.util.Currency =
+        java.util.Currency.getInstance(billing.defaultCurrency)
 }
