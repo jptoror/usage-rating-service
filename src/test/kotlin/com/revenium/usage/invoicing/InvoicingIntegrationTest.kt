@@ -14,6 +14,7 @@ import com.revenium.usage.support.IntegrationTest
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
@@ -41,7 +42,22 @@ class InvoicingIntegrationTest(
 
     private val tenantA = TenantId("tenant-a")
     private val tenantB = TenantId("tenant-b")
-    private val customer = CustomerId("customer-42")
+    /**
+     * A customer unique to each test method.
+     *
+     * Sharing one customer made these tests order-dependent: closing a period in one
+     * test moved another test's charges from RATED to INVOICED, so a test that passed in
+     * isolation failed in the suite. Per-test isolation is cheaper than reasoning about
+     * which test may have closed what.
+     */
+    // A value class cannot be `lateinit`, so this is assigned a placeholder and
+    // replaced per test.
+    private var customer: CustomerId = CustomerId("unassigned")
+
+    @BeforeEach
+    fun assignCustomer() {
+        customer = CustomerId("inv-${System.nanoTime()}")
+    }
 
     /** The period containing "now", so events fall inside the arrival cutoff. */
     private val currentPeriod = BillingPeriod(YearMonth.now(ZoneOffset.UTC))
@@ -86,8 +102,29 @@ class InvoicingIntegrationTest(
         }
     }
 
-    private fun drain(maxCycles: Int = 10) {
-        repeat(maxCycles) { if (worker.pollOnce() == 0) return }
+    /**
+     * Polls until every message for this test's customer has reached a terminal state.
+     *
+     * Not "until pollOnce returns 0": that reports how many messages were CLAIMED, and a
+     * claimed message is still in flight. Stopping there asserted against a half-rated
+     * period and failed intermittently depending on timing.
+     */
+    private fun drain(maxCycles: Int = 30) {
+        repeat(maxCycles) {
+            worker.pollOnce()
+            val outstanding = TenantContext.runAs(tenantA) {
+                jdbc.queryForObject(
+                    """
+                    SELECT count(*) FROM outbox_message o
+                    JOIN raw_event e ON e.id = o.raw_event_id
+                    WHERE e.customer_id = ? AND o.status NOT IN ('DONE','UNRATED','QUARANTINED','FAILED')
+                    """,
+                    Long::class.java,
+                    customer.value,
+                ) ?: 0
+            }
+            if (outstanding == 0L) return
+        }
     }
 
     // --- summaries ---------------------------------------------------------

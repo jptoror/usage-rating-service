@@ -1,0 +1,25 @@
+databaseChangeLog:
+
+  # ---------------------------------------------------------------------------
+  # Which instance processed each message.
+  #
+  # Pure evidence: nothing behaves differently because of this column. The
+  # coordination is entirely FOR UPDATE SKIP LOCKED, which needs no identity at
+  # all. But without recording it there is no way to demonstrate that three
+  # instances took DISJOINT batches, as opposed to one instance draining the queue
+  # while the other two idled -- and "it works multi-instance" is a claim the brief
+  # asks to be substantiated rather than asserted.
+  # ---------------------------------------------------------------------------
+  - changeSet:
+      id: 012-01-outbox-processed-by
+      author: jptoro
+      changes:
+        - addColumn:
+            tableName: outbox_message
+            columns:
+              - column:
+                  name: processed_by
+                  type: TEXT
+                  remarks: Instance that last claimed this message
+      rollback:
+        - dropColumn: { tableName: outbox_message, columnName: processed_by }

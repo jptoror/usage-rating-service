@@ -66,6 +66,35 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    fun `a malformed period is a client error, not a server error`() {
+        // Found by running the service: `period=not-a-period` fell through to the
+        // catch-all and was reported as 500, which tells an integrator to retry and an
+        // operator to investigate -- neither of which is right for bad input.
+        val problem = handler.handleMalformedParameter(
+            java.time.format.DateTimeParseException("Text 'not-a-period' could not be parsed", "not-a-period", 0)
+        )
+
+        assertEquals(HttpStatus.BAD_REQUEST.value(), problem.status)
+        // The offending value is named, so the caller can fix it.
+        assertTrue(problem.detail!!.contains("not-a-period"))
+    }
+
+    @Test
+    fun `an invalid domain value is a client error too`() {
+        val problem = handler.handleMalformedParameter(IllegalArgumentException("customerId must not be blank"))
+        assertEquals(HttpStatus.BAD_REQUEST.value(), problem.status)
+    }
+
+    @Test
+    fun `closing an already-closed period is a conflict, not a server error`() {
+        // A legitimate request that conflicts with current state: 409, not 400 or 500.
+        val problem = handler.handleConflict(IllegalStateException("Period 2026-09 is already closed"))
+
+        assertEquals(HttpStatus.CONFLICT.value(), problem.status)
+        assertTrue(problem.detail!!.contains("already closed"))
+    }
+
+    @Test
     fun `an unexpected failure is 500 with no internal detail`() {
         val problem = handler.handleUnexpected(RuntimeException("NullPointerException at Foo.kt:42"))
 

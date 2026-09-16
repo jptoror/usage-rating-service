@@ -60,9 +60,14 @@ class OutboxClaimRepository(private val jdbc: JdbcTemplate) {
      * `REQUIRES_NEW` so the claim commits on its own. Each message is then processed in
      * its own transaction: one poison message must not roll back the claim for the whole
      * batch, or a single bad row would stall every good one behind it.
+     *
+     * [instanceId] is recorded on each claimed row as evidence of which instance took
+     * which work. It has no default: a default value on a method of a Spring-proxied
+     * bean makes Kotlin emit a synthetic `DefaultConstructorMarker` parameter that
+     * Spring tries to autowire, and the application fails to start.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    fun claimBatch(now: Instant, batchSize: Int): List<ClaimedWork> {
+    fun claimBatch(now: Instant, batchSize: Int, instanceId: String): List<ClaimedWork> {
         val claimed = jdbc.query(
             CLAIM_SQL,
             { rs, _ ->
@@ -86,6 +91,7 @@ class OutboxClaimRepository(private val jdbc: JdbcTemplate) {
             jdbc.update(
                 MARK_PROCESSING_SQL,
                 java.sql.Timestamp.from(now),
+                instanceId,
                 claimed.map { it.outboxId }.toTypedArray(),
             )
         }
@@ -129,7 +135,7 @@ class OutboxClaimRepository(private val jdbc: JdbcTemplate) {
 
         const val MARK_PROCESSING_SQL = """
             UPDATE outbox_message
-            SET status = 'PROCESSING', updated_at = ?
+            SET status = 'PROCESSING', updated_at = ?, processed_by = ?
             WHERE id = ANY (?)
         """
 

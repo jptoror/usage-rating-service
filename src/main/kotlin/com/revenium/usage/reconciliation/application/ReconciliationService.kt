@@ -189,7 +189,11 @@ class ReconciliationService(
     fun lines(
         customer: CustomerId,
         period: BillingPeriod,
-        transactionCode: String? = null,
+        // No default value: this bean is proxied for both @RequiresTenant and
+        // @Transactional, and a default on a proxied method makes Kotlin emit a
+        // synthetic DefaultConstructorMarker parameter that Spring tries to autowire.
+        // The only caller passes it explicitly anyway.
+        transactionCode: String?,
     ): List<ReconciliationLine> {
         val tenant = TenantContext.current().value
 
