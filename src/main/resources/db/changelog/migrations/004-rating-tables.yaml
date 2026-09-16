@@ -1,0 +1,116 @@
+databaseChangeLog:
+
+  # ---------------------------------------------------------------------------
+  # rated_transaction -- the calculated result.
+  #
+  # Recomputable, unlike raw_event. Corrections never UPDATE an amount in place:
+  # a new row is inserted and the old one points at it via superseded_by, so the
+  # history of what was billed and why stays intact.
+  # ---------------------------------------------------------------------------
+  - changeSet:
+      id: 004-01-rated-transaction
+      author: jptoro
+      changes:
+        - createTable:
+            tableName: rated_transaction
+            columns:
+              - column: { name: id, type: BIGINT, autoIncrement: true, constraints: { primaryKey: true, primaryKeyName: pk_rated_transaction } }
+              - column: { name: tenant_id, type: TEXT, constraints: { nullable: false } }
+              - column: { name: raw_event_id, type: BIGINT, constraints: { nullable: false } }
+              - column: { name: customer_id, type: TEXT, constraints: { nullable: false } }
+              - column: { name: transaction_code, type: TEXT, constraints: { nullable: false } }
+
+              # Which rule was applied...
+              - column: { name: pricing_rule_id, type: BIGINT, constraints: { nullable: false } }
+              # ...and the value it had at the time. Deliberately redundant: the
+              # rule may be corrected later, and this row must keep explaining
+              # its own amount without depending on the current pricing table.
+              - column: { name: unit_price, type: "NUMERIC(19,6)", constraints: { nullable: false } }
+              - column: { name: quantity, type: "NUMERIC(19,6)", constraints: { nullable: false } }
+              # Rounded once, HALF_UP, at scale 4.
+              - column: { name: amount, type: "NUMERIC(19,4)", constraints: { nullable: false } }
+              - column: { name: currency, type: "CHAR(3)", constraints: { nullable: false } }
+
+              - column: { name: occurred_at, type: TIMESTAMPTZ, constraints: { nullable: false } }
+              # The period this amount is billed in. May differ from origin_period
+              # when the event arrived after its own period had closed.
+              - column: { name: billing_period, type: DATE, constraints: { nullable: false } }
+              # The natural period of occurred_at. Always the truth about consumption.
+              - column: { name: origin_period, type: DATE, constraints: { nullable: false } }
+              - column: { name: is_late_adjustment, type: BOOLEAN, defaultValueBoolean: false, constraints: { nullable: false } }
+
+              - column: { name: rated_at, type: TIMESTAMPTZ, defaultValueComputed: now(), constraints: { nullable: false } }
+              # Set when this row has been replaced by a correction.
+              - column: { name: superseded_by, type: BIGINT }
+              - column: { name: superseded_reason, type: TEXT }
+
+        - addForeignKeyConstraint:
+            baseTableName: rated_transaction
+            baseColumnNames: raw_event_id
+            referencedTableName: raw_event
+            referencedColumnNames: id
+            constraintName: fk_rated_transaction_raw_event
+        - addForeignKeyConstraint:
+            baseTableName: rated_transaction
+            baseColumnNames: pricing_rule_id
+            referencedTableName: pricing_rule
+            referencedColumnNames: id
+            constraintName: fk_rated_transaction_pricing_rule
+        - addForeignKeyConstraint:
+            baseTableName: rated_transaction
+            baseColumnNames: superseded_by
+            referencedTableName: rated_transaction
+            referencedColumnNames: id
+            constraintName: fk_rated_transaction_superseded_by
+
+        - sql:
+            sql: ALTER TABLE rated_transaction ADD CONSTRAINT ck_rated_quantity_positive CHECK (quantity > 0)
+        - sql:
+            sql: ALTER TABLE rated_transaction ADD CONSTRAINT ck_rated_amount_non_negative CHECK (amount >= 0)
+        - sql:
+            sql: ALTER TABLE rated_transaction ADD CONSTRAINT ck_rated_not_self_superseded CHECK (superseded_by IS NULL OR superseded_by <> id)
+        # A late adjustment is exactly the case where the two periods differ.
+        - sql:
+            sql: >
+              ALTER TABLE rated_transaction ADD CONSTRAINT ck_rated_late_adjustment_consistent
+              CHECK (is_late_adjustment = (billing_period <> origin_period))
+
+  - changeSet:
+      id: 004-02-rated-transaction-unique-current
+      author: jptoro
+      comment: >
+        No double billing, enforced by the database. Partial: only the row that has
+        not been superseded counts, so corrections can coexist with the original.
+        This is what makes at-least-once delivery safe -- two workers rating the
+        same event concurrently still produce exactly one current row.
+      changes:
+        - sql:
+            sql: >
+              CREATE UNIQUE INDEX uq_rated_transaction_current
+              ON rated_transaction (tenant_id, raw_event_id)
+              WHERE superseded_by IS NULL
+            rollback: DROP INDEX uq_rated_transaction_current
+
+  - changeSet:
+      id: 004-03-rated-transaction-indexes
+      author: jptoro
+      changes:
+        # Invoice summary: group by transaction code within a customer and period.
+        - createIndex:
+            tableName: rated_transaction
+            indexName: ix_rated_transaction_invoice_summary
+            columns:
+              - column: { name: tenant_id }
+              - column: { name: customer_id }
+              - column: { name: billing_period }
+              - column: { name: transaction_code }
+        # Reconciliation: what really happened in the period the event belongs to.
+        - createIndex:
+            tableName: rated_transaction
+            indexName: ix_rated_transaction_origin_period
+            columns:
+              - column: { name: tenant_id }
+              - column: { name: origin_period }
+      rollback:
+        - dropIndex: { tableName: rated_transaction, indexName: ix_rated_transaction_invoice_summary }
+        - dropIndex: { tableName: rated_transaction, indexName: ix_rated_transaction_origin_period }

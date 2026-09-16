@@ -1,0 +1,14 @@
+databaseChangeLog:
+  - changeSet:
+      id: 001-btree-gist
+      author: jptoro
+      comment: >
+        btree_gist lets a GiST exclusion constraint mix equality columns
+        (tenant_id, transaction_code) with a range column. Required by the
+        non-overlap constraint on pricing_rule in changeset 003.
+      changes:
+        - sql:
+            sql: CREATE EXTENSION IF NOT EXISTS btree_gist
+      rollback:
+        - sql:
+            sql: DROP EXTENSION IF EXISTS btree_gist
