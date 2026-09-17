@@ -1,5 +1,7 @@
 package com.revenium.usage.invoicing.api
 
+import com.revenium.usage.invoicing.domain.model.UsageSummary
+import com.revenium.usage.invoicing.domain.model.UsageLine
 import com.ninjasquad.springmockk.MockkBean
 import com.revenium.usage.invoicing.application.InvoiceService
 import com.revenium.usage.invoicing.domain.model.InvoiceStatus
@@ -115,5 +117,46 @@ class InvoiceControllerTest(@Autowired val mvc: MockMvc) {
             .andExpect(status().isOk)
             .andExpect(jsonPath("$.status").value("CLOSED"))
             .andExpect(jsonPath("$.totalAmount").value(1277.5000))
+    }
+
+    @Test
+    fun `a range summary reports every period and its status`() {
+        every { invoiceService.summariseRange(any(), any(), any()) } returns UsageSummary.from(
+            customer = CustomerId("customer-42"),
+            from = BillingPeriod.parse("2026-07"),
+            to = BillingPeriod.parse("2026-09"),
+            currency = Currency.getInstance("USD"),
+            periods = listOf(
+                UsageSummary.PeriodStatus(BillingPeriod.parse("2026-07"), InvoiceStatus.CLOSED),
+                UsageSummary.PeriodStatus(BillingPeriod.parse("2026-08"), InvoiceStatus.CLOSED),
+                UsageSummary.PeriodStatus(BillingPeriod.parse("2026-09"), InvoiceStatus.OPEN),
+            ),
+            lines = listOf(
+                UsageLine(
+                    transactionCode = TransactionCode("VEHICLE_REGISTRATION"),
+                    transactionCount = 12,
+                    totalQuantity = Quantity(BigDecimal("24")),
+                    amount = Money.of(BigDecimal("60.0000"), Currency.getInstance("USD")),
+                )
+            ),
+        )
+
+        mvc.perform(
+            get("/api/v1/invoices/usage")
+                .header("X-Tenant-Id", "tenant-a")
+                .param("customerId", "customer-42")
+                .param("from", "2026-07")
+                .param("to", "2026-09")
+        )
+            .andExpect(status().isOk)
+            .andExpect(jsonPath("$.from").value("2026-07"))
+            .andExpect(jsonPath("$.to").value("2026-09"))
+            // A range can straddle closed and open periods, so the status is per period
+            // rather than one value for the whole response.
+            .andExpect(jsonPath("$.periods.length()").value(3))
+            .andExpect(jsonPath("$.periods[0].status").value("CLOSED"))
+            .andExpect(jsonPath("$.periods[2].status").value("OPEN"))
+            .andExpect(jsonPath("$.lines[0].transactionCount").value(12))
+            .andExpect(jsonPath("$.totalAmount").value(60.0000))
     }
 }

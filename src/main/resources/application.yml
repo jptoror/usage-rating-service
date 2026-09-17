@@ -2,6 +2,14 @@ spring:
   application:
     name: usage-rating-service
 
+  lifecycle:
+    # How long shutdown waits for in-flight work before interrupting it. Declared rather
+    # than left to Spring's 30s default: this window has to exceed the worker's batch
+    # duration, or a SIGTERM during a large batch interrupts rating mid-flight. It also
+    # has to stay below the orchestrator's own kill timeout (Kubernetes defaults to 30s
+    # of terminationGracePeriodSeconds), which is why this is a fraction of it.
+    timeout-per-shutdown-phase: ${SHUTDOWN_TIMEOUT:20s}
+
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/usage_rating}
     username: ${DB_USER:usage_app}
@@ -42,6 +50,9 @@ spring:
       fail-on-unknown-properties: false   # forward compatible: upstream may add fields
 
 server:
+  # On SIGTERM the worker stops claiming and finishes its current batch. Claimed work
+  # that does not finish within the window stays claimed and is reclaimed by another
+  # instance after the stale-claim timeout, so nothing is lost either way.
   shutdown: graceful
   error:
     include-message: always

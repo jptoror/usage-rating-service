@@ -40,9 +40,9 @@ Java 21 is required: `export JAVA_HOME=$(/usr/libexec/java_home -v 21)`
 
 | | |
 | --- | --- |
-| Unit tests | 301 |
+| Unit tests | 309 |
 | Integration tests | 44 (Testcontainers) |
-| Line coverage | **91.17%** against an 85% gate |
+| Line coverage | **91.64%** against an 85% gate |
 | Scripted checks | 22 end-to-end + 22 edge cases + 8 multi-instance |
 | Measured throughput | ~330 events/s ingested, 228 events/s rated on **one** tuned instance |
 
@@ -125,6 +125,35 @@ curl -s -G localhost:8080/api/v1/invoices/summary \
   "totalAmount": 5.0000
 }
 ```
+
+### 3b — Total a range of periods
+
+```bash
+curl -s -G localhost:8080/api/v1/invoices/usage \
+  -H 'X-Tenant-Id: tenant-a' \
+  --data-urlencode 'customerId=customer-42' \
+  --data-urlencode 'from=2026-06' --data-urlencode 'to=2026-08'
+```
+
+```json
+{
+  "from": "2026-06", "to": "2026-08", "currency": "USD",
+  "periods": [
+    { "period": "2026-06", "status": "CLOSED" },
+    { "period": "2026-07", "status": "CLOSED" },
+    { "period": "2026-08", "status": "OPEN" }
+  ],
+  "lines": [
+    { "transactionCode": "VEHICLE_REGISTRATION", "transactionCount": 12,
+      "totalQuantity": 24, "amount": 60.0000 }
+  ],
+  "totalAmount": 60.0000,
+  "transactionCount": 12
+}
+```
+
+Closed periods contribute the figures they were billed at, never a re-aggregation, so
+this can never disagree with an invoice already sent.
 
 ### 4 — Trace the total back to its events
 
@@ -450,13 +479,31 @@ stack trace never reaches a client.
 | --- | --- | --- |
 | `POST` | `/api/v1/transactions` | Ingest one transaction |
 | `POST` | `/api/v1/transactions/batch` | Ingest a batch, per-item results |
-| `GET` | `/api/v1/invoices/summary` | Summary for a customer and period |
+| `GET` | `/api/v1/invoices/summary` | Invoice summary for a customer and one period |
+| `GET` | `/api/v1/invoices/usage` | Usage totals across a range of periods (`from`/`to`) |
 | `POST` | `/api/v1/invoices/close` | Close a period (administrative) |
 | `GET` | `/api/v1/reconciliation/report` | State counts and balance check |
 | `GET` | `/api/v1/reconciliation/lines` | Transactions behind a total |
 | `GET` | `/api/v1/pricing-rules` | The tenant's rules |
 | `GET` | `/api/v1/pricing-rules/{id}` | One rule, to verify an amount |
 | `GET` | `/actuator/health` | Liveness and readiness |
+
+### Two summaries, and why they are separate endpoints
+
+`/invoices/summary` answers a billing question about one period, and carries that
+period's status. `/invoices/usage` answers a reporting question across a range, taking
+`from` and `to` as `YYYY-MM`, inclusive.
+
+They are separate rather than one endpoint with optional range parameters because a range
+can straddle closed and open periods, so there is no single status to report — the range
+response lists each period with its own. Calling that result an invoice would be a lie
+about what it is.
+
+The range is built by summarising each period in turn, not with one wide query. That
+costs one query per month, and it is what guarantees a closed period contributes exactly
+the figures it was billed at: a single `GROUP BY` over `rated_transaction` would silently
+re-aggregate closed months and could disagree with an invoice already sent. Bounded to 24
+months, since the cost is linear in the span and anything wider is a data export.
 
 ### Contract extensions
 
@@ -559,6 +606,7 @@ credentials are committed.
 | `BILLING_LATE_ARRIVAL_MAX_AGE` | `P90D` | Beyond this, late events are quarantined |
 | `OUTBOX_POLL_INTERVAL` | `1000ms` | Worker poll cadence |
 | `OUTBOX_MAX_ATTEMPTS` | `5` | Attempts before dead-lettering |
+| `SHUTDOWN_TIMEOUT` | `20s` | Grace period for in-flight work on `SIGTERM` |
 
 Graceful shutdown is enabled: on `SIGTERM` the worker stops claiming new work and finishes
 its current batch. Unclaimed work stays `PENDING`; claimed-but-unfinished work is reclaimed

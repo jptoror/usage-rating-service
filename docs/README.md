@@ -43,7 +43,7 @@ well as by hand.
 
 ## Why the scripts exist alongside the test suite
 
-The automated suite (345 tests, 91.17% line coverage) runs against Testcontainers and
+The automated suite (353 tests, 91.64% line coverage) runs against Testcontainers and
 covers the domain thoroughly. The scripts cover what it structurally cannot:
 
 - **The wire.** A scale lost in JSON, a timezone applied by a driver, a numeric column

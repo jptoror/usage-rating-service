@@ -1,6 +1,7 @@
 package com.revenium.usage.invoicing.domain.port.`in`
 
 import com.revenium.usage.invoicing.domain.model.InvoiceSummary
+import com.revenium.usage.invoicing.domain.model.UsageSummary
 import com.revenium.usage.shared.domain.BillingPeriod
 import com.revenium.usage.shared.domain.CustomerId
 
@@ -12,4 +13,13 @@ import com.revenium.usage.shared.domain.CustomerId
  */
 interface SummariseInvoiceUseCase {
     fun summarise(customer: CustomerId, period: BillingPeriod): InvoiceSummary
+
+    /**
+     * Totals usage across a span of periods, inclusive at both ends.
+     *
+     * A separate operation rather than an optional range on [summarise]: the result is
+     * deliberately a [UsageSummary] and not an invoice, because a range can cover both
+     * closed and open periods and so has no single status to report.
+     */
+    fun summariseRange(customer: CustomerId, from: BillingPeriod, to: BillingPeriod): UsageSummary
 }

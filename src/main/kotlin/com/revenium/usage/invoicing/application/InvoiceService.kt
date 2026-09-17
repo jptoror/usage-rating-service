@@ -6,6 +6,8 @@ import com.revenium.usage.invoicing.domain.model.InvoiceLine
 import com.revenium.usage.invoicing.domain.model.InvoiceStatus
 import com.revenium.usage.invoicing.domain.model.InvoiceSummary
 import com.revenium.usage.invoicing.domain.model.SummaryLine
+import com.revenium.usage.invoicing.domain.model.UsageLine
+import com.revenium.usage.invoicing.domain.model.UsageSummary
 import com.revenium.usage.invoicing.domain.port.`in`.ClosePeriodUseCase
 import com.revenium.usage.invoicing.domain.port.`in`.SummariseInvoiceUseCase
 import com.revenium.usage.invoicing.domain.port.out.ChargeLookup
@@ -57,6 +59,61 @@ class InvoiceService(
         } else {
             summariseFromRatedTransactions(customer, period, existing)
         }
+    }
+
+    /**
+     * Totals usage across a span of periods.
+     *
+     * Built by summarising each period in turn rather than with one wide query, so a
+     * closed period still reports exactly the figures it was billed at. A single range
+     * query over `rated_transaction` would silently re-aggregate closed months and could
+     * disagree with an invoice already sent.
+     *
+     * The cost is one query per period in the range, which is why the range is bounded.
+     */
+    @Transactional(readOnly = true)
+    override fun summariseRange(
+        customer: CustomerId,
+        from: BillingPeriod,
+        to: BillingPeriod,
+    ): UsageSummary {
+        require(from <= to) { "from ($from) must not be after to ($to)" }
+        val span = generateSequence(from) { it.next() }.takeWhile { it <= to }.toList()
+        require(span.size <= MAX_RANGE_MONTHS) {
+            "A range may cover at most $MAX_RANGE_MONTHS months, was ${span.size}"
+        }
+
+        val summaries = span.map { it to summarise(customer, it) }
+
+        // Lines carry an originPeriod within a single invoice; across a range that
+        // distinction belongs to the period breakdown, so codes are totalled here.
+        val lines = summaries
+            .flatMap { (_, summary) -> summary.lines }
+            .groupBy { it.transactionCode }
+            .map { (code, group) ->
+                UsageLine(
+                    transactionCode = code,
+                    transactionCount = group.sumOf { it.transactionCount },
+                    totalQuantity = Quantity(group.sumOf { it.totalQuantity.value }),
+                    // Summed, never recalculated: each amount was rounded once at rating.
+                    amount = Money.sum(group.map { it.amount }, group.first().amount.currency),
+                )
+            }
+
+        val currency = summaries.firstOrNull { it.second.lines.isNotEmpty() }
+            ?.second?.currency
+            ?: defaultCurrency
+
+        return UsageSummary.from(
+            customer = customer,
+            from = from,
+            to = to,
+            currency = currency,
+            periods = summaries.map { (period, summary) ->
+                UsageSummary.PeriodStatus(period, summary.status)
+            },
+            lines = lines,
+        )
     }
 
     private fun summariseFromClosedInvoice(
@@ -188,5 +245,16 @@ class InvoiceService(
                 "across ${summary.transactionCount} transactions"
         }
         return summary
+    }
+
+    private companion object {
+        /**
+         * Bound on a range summary, in months.
+         *
+         * The range is built one period at a time to keep closed periods frozen, so its
+         * cost is linear in the span. Two years is past any reporting question this
+         * service is meant to answer directly; anything wider is a data export.
+         */
+        const val MAX_RANGE_MONTHS = 24
     }
 }
