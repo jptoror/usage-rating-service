@@ -40,9 +40,9 @@ Java 21 is required: `export JAVA_HOME=$(/usr/libexec/java_home -v 21)`
 
 | | |
 | --- | --- |
-| Unit tests | 274 |
-| Integration tests | 40 (Testcontainers) |
-| Line coverage | **90.7%** against an 85% gate |
+| Unit tests | 301 |
+| Integration tests | 41 (Testcontainers) |
+| Line coverage | **91.17%** against an 85% gate |
 | Scripted checks | 22 end-to-end + 22 edge cases + 8 multi-instance |
 | Measured throughput | ~330 events/s ingested, 228 events/s rated on **one** tuned instance |
 
@@ -91,7 +91,7 @@ curl -s -X POST localhost:8080/api/v1/transactions \
 ```
 
 ```json
-{ "status": "ACCEPTED", "eventId": "73d4e120-…", "receivedAt": "2026-09-16T10:00:00Z" }
+{ "eventId": "73d4e120-…", "receivedAt": "2026-09-16T10:00:00Z", "status": "ACCEPTED" }
 ```
 
 ### 2 — Re-deliver the same event
@@ -99,7 +99,7 @@ curl -s -X POST localhost:8080/api/v1/transactions \
 Running the identical command again returns `200`, not `409`:
 
 ```json
-{ "status": "DUPLICATE", "eventId": "73d4e120-…", "originalReceivedAt": "2026-09-16T10:00:00Z" }
+{ "eventId": "73d4e120-…", "originalReceivedAt": "2026-09-16T10:00:00Z", "status": "DUPLICATE" }
 ```
 
 ### 3 — Summarise the period
@@ -186,14 +186,29 @@ com.revenium.usage
 └─ shared          domain primitives, errors, configuration
 ```
 
-Each module is layered `api → application → domain`, with `infrastructure → domain`.
+Each module is sliced the same way:
+
+```
+<module>
+├─ api                        controllers, DTOs
+├─ application                @Service, transaction boundaries
+├─ domain                     depends on nothing
+│  ├─ model                   plain Kotlin, no framework annotation, not even JPA
+│  ├─ port/in                 one inbound port per use case
+│  └─ port/out                only the operations the module needs
+└─ infrastructure/persistence @Entity mirroring the table, plus its adapter
+```
+
 **The `domain` layer depends on nothing else in the project**, which is what lets the
 rating rules, monetary arithmetic and period boundaries be unit-tested with no Spring
-context and no database.
+context and no database. The `@Entity` never leaves `infrastructure/persistence`: it
+mirrors the *table* in primitives and converts through `toDomain()`/`fromDomain()`, so
+the model is free to hold typed values and enforce its invariants in `init`.
 
-Cross-module calls go through a port owned by the *consuming* module — `PricingRuleLookup`
-and `BillingPeriodStatusLookup` are both interfaces in the domain, implemented in
-infrastructure.
+Cross-module calls go through a port owned by the *consuming* module, never a whole
+`JpaRepository` — a read-only consumer does not get `save` and `deleteAll`.
+[`docs/diagrams/architecture.md`](docs/diagrams/architecture.md) has the full table of
+ports and the two adapters that deliberately stayed raw JDBC.
 
 ### Data model
 
@@ -599,3 +614,26 @@ ingestion injecting the outbox's. Two of them also handed a module **write acces
 had no business holding: invoicing could have deleted rated transactions, ingestion
 could have emptied the work queue. Each is now a port owned by the consuming module, and
 `DependencyRuleTest` fails the build if any regresses.
+
+Two more the local build could not have found, because both need a *fresh clone* rather
+than a working tree:
+
+- **`.gitignore` excluded every outbound port.** It carried `out/` for IntelliJ's build
+  directory; unanchored, that matches any directory named `out` at any depth, so all
+  eight `domain/port/out` packages were silently never committed. Locally the files
+  exist and everything compiles. CI, which clones, failed with `Unresolved reference
+  'out'`. Anchored to `/out/`, and nothing under `src/` is ignored now.
+- **The aggregating check reported success while compilation was failing.** The compile
+  job was missing from its `needs`, and it counted a *skipped* job as acceptable — so
+  when compilation broke and its five dependents skipped, the one status check branch
+  protection requires went green having verified nothing. Only the PR-only
+  multi-instance job may skip now; any other skip fails the check, and the logic is
+  tested against the exact shape that slipped through.
+
+And one test that was passing for the wrong reason: the multi-instance distribution
+assertion compared how many instances claimed work, with a batch size (200) larger than
+the workload (60). The first worker to wake legitimately took everything. Locally the
+containers are warm and overlap, so it usually split and passed; on a cold runner one
+worker won every time. It was measuring startup order, not coordination. CI now runs it
+with a batch of 10, and the script reports the batch size and says so when the batch is
+too large to observe distribution rather than blaming `SKIP LOCKED`.

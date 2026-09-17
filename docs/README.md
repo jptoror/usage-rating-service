@@ -43,7 +43,7 @@ well as by hand.
 
 ## Why the scripts exist alongside the test suite
 
-The automated suite (314 tests, 90.7% line coverage) runs against Testcontainers and
+The automated suite (342 tests, 91.17% line coverage) runs against Testcontainers and
 covers the domain thoroughly. The scripts cover what it structurally cannot:
 
 - **The wire.** A scale lost in JSON, a timezone applied by a driver, a numeric column
@@ -56,8 +56,10 @@ covers the domain thoroughly. The scripts cover what it structurally cannot:
   creation compiles, unit-tests green, and fails only when the container starts. That
   happened; `ApplicationContextIntegrationTest` now catches it.
 
-Three defects reached the finished service and were found only by running it — all
-listed in the root README under "Notes from building this."
+Several defects reached the finished service and were found only by running it — and two
+more needed a fresh clone rather than a working tree, so not even running it locally
+would have shown them. All are listed in the root README under "Notes from building
+this."
 
 Measuring rather than estimating corrected a fourth thing: the complexity analysis had
 claimed a worker sustains "a few hundred messages per second", reasoning from per-message
