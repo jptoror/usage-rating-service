@@ -2,10 +2,10 @@ package com.revenium.usage.ingestion.api
 
 import com.ninjasquad.springmockk.MockkBean
 import com.revenium.usage.ingestion.application.IngestionService
-import com.revenium.usage.ingestion.domain.IngestionResult
-import com.revenium.usage.ingestion.domain.RawTransactionInput
+import com.revenium.usage.ingestion.domain.model.IngestionResult
+import com.revenium.usage.ingestion.domain.model.RawTransactionInput
 import com.revenium.usage.shared.domain.EventId
-import com.revenium.usage.ingestion.domain.ValidationFailure
+import com.revenium.usage.ingestion.domain.model.ValidationFailure
 import com.revenium.usage.tenancy.MissingTenantException
 import io.mockk.every
 import io.mockk.slot
@@ -253,6 +253,15 @@ class TransactionControllerTest(@Autowired val mvc: MockMvc) {
             .andExpect(jsonPath("$.duplicates").value(1))
             .andExpect(jsonPath("$.rejected").value(1))
             .andExpect(jsonPath("$.results.length()").value(3))
+            // Inside the list the static type is the sealed interface, so this is where
+            // a polymorphic serialisation problem would surface: counts alone would
+            // still pass while every item serialised as an empty object.
+            .andExpect(jsonPath("$.results[0].status").value("ACCEPTED"))
+            .andExpect(jsonPath("$.results[0].receivedAt").exists())
+            .andExpect(jsonPath("$.results[1].status").value("DUPLICATE"))
+            .andExpect(jsonPath("$.results[1].originalReceivedAt").exists())
+            .andExpect(jsonPath("$.results[2].status").value("REJECTED"))
+            .andExpect(jsonPath("$.results[2].failures[0].field").value("eventId"))
     }
 
     @Test
@@ -272,5 +281,48 @@ class TransactionControllerTest(@Autowired val mvc: MockMvc) {
             .andExpect(status().isOk)
             .andExpect(jsonPath("$.accepted").value(1))
             .andExpect(jsonPath("$.rejected").value(1))
+    }
+
+    // --- response shape ----------------------------------------------------
+    //
+    // Each outcome is its own type, so a field belonging to another outcome cannot be
+    // set at all. These assert the absence is structural rather than a null that
+    // happened to be filtered out on the way to the wire.
+
+    @Test
+    fun `an acceptance carries no field belonging to another outcome`() {
+        every { ingestionService.ingest(any()) } returns
+            IngestionResult.Accepted(EventId(eventId), 1L, now)
+
+        postTransaction()
+            .andExpect(jsonPath("$.receivedAt").exists())
+            .andExpect(jsonPath("$.originalReceivedAt").doesNotExist())
+            .andExpect(jsonPath("$.payloadConflict").doesNotExist())
+            .andExpect(jsonPath("$.failures").doesNotExist())
+    }
+
+    @Test
+    fun `a duplicate carries no acceptance or rejection field`() {
+        every { ingestionService.ingest(any()) } returns
+            IngestionResult.Duplicate(EventId(eventId), 1L, now, conflictingPayload = false)
+
+        postTransaction()
+            .andExpect(jsonPath("$.originalReceivedAt").exists())
+            .andExpect(jsonPath("$.receivedAt").doesNotExist())
+            .andExpect(jsonPath("$.failures").doesNotExist())
+    }
+
+    @Test
+    fun `a rejection carries no timestamp`() {
+        every { ingestionService.ingest(any()) } returns IngestionResult.Rejected(
+            EventId(eventId),
+            listOf(ValidationFailure("customerId", "is required")),
+        )
+
+        postTransaction()
+            .andExpect(jsonPath("$.failures").exists())
+            .andExpect(jsonPath("$.receivedAt").doesNotExist())
+            .andExpect(jsonPath("$.originalReceivedAt").doesNotExist())
+            .andExpect(jsonPath("$.payloadConflict").doesNotExist())
     }
 }

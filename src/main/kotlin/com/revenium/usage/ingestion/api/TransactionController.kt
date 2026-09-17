@@ -1,9 +1,9 @@
 package com.revenium.usage.ingestion.api
 
 import tools.jackson.databind.ObjectMapper
-import com.revenium.usage.ingestion.application.IngestionService
-import com.revenium.usage.ingestion.domain.IngestionResult
-import com.revenium.usage.ingestion.domain.RawTransactionInput
+import com.revenium.usage.ingestion.domain.port.`in`.IngestTransactionUseCase
+import com.revenium.usage.ingestion.domain.model.IngestionResult
+import com.revenium.usage.ingestion.domain.model.RawTransactionInput
 import io.swagger.v3.oas.annotations.Operation
 import io.swagger.v3.oas.annotations.Parameter
 import io.swagger.v3.oas.annotations.responses.ApiResponse
@@ -22,7 +22,7 @@ import java.security.MessageDigest
 @RequestMapping("/api/v1/transactions")
 @Tag(name = "Transactions", description = "Usage transaction ingestion")
 class TransactionController(
-    private val ingestionService: IngestionService,
+    private val ingestTransaction: IngestTransactionUseCase,
     private val objectMapper: ObjectMapper,
 ) {
 
@@ -51,7 +51,7 @@ class TransactionController(
         @RequestHeader("X-Tenant-Id") tenantHeader: String,
         @RequestBody request: TransactionRequest,
     ): ResponseEntity<TransactionResponse> {
-        val result = ingestionService.ingest(request.toInput())
+        val result = ingestTransaction.ingest(request.toInput())
         return result.toResponseEntity()
     }
 
@@ -69,7 +69,7 @@ class TransactionController(
         @RequestHeader("X-Tenant-Id") tenantHeader: String,
         @RequestBody requests: List<TransactionRequest>,
     ): ResponseEntity<BatchTransactionResponse> {
-        val results = requests.map { ingestionService.ingest(it.toInput()) }
+        val results = requests.map { ingestTransaction.ingest(it.toInput()) }
 
         return ResponseEntity.ok(
             BatchTransactionResponse(
@@ -106,21 +106,20 @@ class TransactionController(
 }
 
 internal fun IngestionResult.toResponse(): TransactionResponse = when (this) {
-    is IngestionResult.Accepted -> TransactionResponse(
-        status = "ACCEPTED",
+    is IngestionResult.Accepted -> AcceptedResponse(
         eventId = eventId.toString(),
         receivedAt = receivedAt,
     )
 
-    is IngestionResult.Duplicate -> TransactionResponse(
-        status = "DUPLICATE",
+    is IngestionResult.Duplicate -> DuplicateResponse(
         eventId = eventId.toString(),
         originalReceivedAt = originalReceivedAt,
+        // Absent rather than false: a conflict is an exception worth noticing, and a
+        // field that is almost always false trains readers to skip it.
         payloadConflict = if (conflictingPayload) true else null,
     )
 
-    is IngestionResult.Rejected -> TransactionResponse(
-        status = "REJECTED",
+    is IngestionResult.Rejected -> RejectedResponse(
         eventId = eventId?.toString(),
         failures = failures.map { FailureDetail(it.field, it.reason) },
     )
