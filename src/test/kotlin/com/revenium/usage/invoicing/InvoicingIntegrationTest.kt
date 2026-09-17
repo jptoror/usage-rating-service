@@ -1,10 +1,10 @@
 package com.revenium.usage.invoicing
 
 import com.revenium.usage.ingestion.application.IngestionService
-import com.revenium.usage.ingestion.domain.IngestionResult
-import com.revenium.usage.ingestion.domain.RawTransactionInput
+import com.revenium.usage.ingestion.domain.model.IngestionResult
+import com.revenium.usage.ingestion.domain.model.RawTransactionInput
 import com.revenium.usage.invoicing.application.InvoiceService
-import com.revenium.usage.invoicing.domain.InvoiceStatus
+import com.revenium.usage.invoicing.domain.model.InvoiceStatus
 import com.revenium.usage.processing.application.OutboxWorker
 import com.revenium.usage.reconciliation.application.ReconciliationService
 import com.revenium.usage.reconciliation.domain.EventState
@@ -179,7 +179,7 @@ class InvoicingIntegrationTest(
         }
 
         assertEquals(2, summary.lines.size)
-        val vehicle = assertNotNull(summary.lines.firstOrNull { it.transactionCode == "VEHICLE_REGISTRATION" })
+        val vehicle = assertNotNull(summary.lines.firstOrNull { it.transactionCode.value == "VEHICLE_REGISTRATION" })
         assertEquals(2, vehicle.transactionCount)
         assertEquals("10.0000", vehicle.amount.amount.toPlainString())
     }

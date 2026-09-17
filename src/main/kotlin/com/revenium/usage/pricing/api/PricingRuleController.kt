@@ -1,6 +1,7 @@
 package com.revenium.usage.pricing.api
 
-import com.revenium.usage.pricing.infrastructure.PricingRuleJpaRepository
+import com.revenium.usage.pricing.domain.model.PricingRule
+import com.revenium.usage.pricing.domain.port.out.PricingRuleLookup
 import com.revenium.usage.tenancy.RequiresTenant
 import com.revenium.usage.tenancy.TenantContext
 import io.swagger.v3.oas.annotations.Operation
@@ -43,7 +44,7 @@ data class PricingRuleResponse(
 @RequestMapping("/api/v1/pricing-rules")
 @Tag(name = "Pricing rules", description = "Effective-dated prices (read-only)")
 @RequiresTenant
-class PricingRuleController(private val repository: PricingRuleJpaRepository) {
+class PricingRuleController(private val pricingRules: PricingRuleLookup) {
 
     @GetMapping
     @Operation(summary = "List the tenant's pricing rules")
@@ -53,8 +54,7 @@ class PricingRuleController(private val repository: PricingRuleJpaRepository) {
     ): ResponseEntity<List<PricingRuleResponse>> {
         val tenant = TenantContext.current()
         return ResponseEntity.ok(
-            repository.findByTenantIdOrderByTransactionCodeAscEffectiveFromAsc(tenant.value)
-                .map { it.toResponse() }
+            pricingRules.findAllFor(tenant).map { it.toResponse() }
         )
     }
 
@@ -69,21 +69,20 @@ class PricingRuleController(private val repository: PricingRuleJpaRepository) {
         @PathVariable id: Long,
     ): ResponseEntity<PricingRuleResponse> {
         val tenant = TenantContext.current()
-        // Row-level security already restricts this, but the tenant is checked
-        // explicitly too: a 404 rather than a leak, even if a policy were ever dropped.
-        val rule = repository.findById(id).orElse(null)
-            ?.takeIf { it.tenantId == tenant.value }
+        // The lookup scopes by tenant as well as id, so a rule belonging to someone else
+        // is a 404 rather than a leak, even if a row-level policy were ever dropped.
+        val rule = pricingRules.findById(tenant, id)
             ?: return ResponseEntity.notFound().build()
 
         return ResponseEntity.ok(rule.toResponse())
     }
 }
 
-private fun com.revenium.usage.pricing.domain.PricingRule.toResponse() = PricingRuleResponse(
+private fun PricingRule.toResponse() = PricingRuleResponse(
     id = id,
-    transactionCode = transactionCode,
-    unitPrice = unitPrice,
-    currency = currency,
+    transactionCode = transactionCode.value,
+    unitPrice = unitPrice.value,
+    currency = currency.currencyCode,
     effectiveFrom = effectiveFrom,
     effectiveTo = effectiveTo,
     description = description,

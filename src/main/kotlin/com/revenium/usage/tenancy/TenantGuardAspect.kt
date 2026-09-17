@@ -13,31 +13,18 @@ private val log = KotlinLogging.logger {}
 
 /**
  * Enforces that [RequiresTenant] boundaries execute inside a tenant scope, and that
- * any [TenantScoped] argument matches the tenant in scope.
+ * any [TenantScoped] argument matches the tenant in scope. Applied at the service boundary,
+ * where a unit of work begins and there is enough context for a useful error.
  *
- * **Pointcut.** `@annotation` covers individually annotated methods, `@within` covers
- * every public method of an annotated class. It is applied at the *service* boundary
- * rather than at repositories: that is where a unit of work begins, and where there is
- * enough context to produce a useful error.
+ * Ordered ahead of Spring's transaction advice (which defaults to [Ordered.LOWEST_PRECEDENCE])
+ * so a cross-tenant call is rejected before a pooled connection is taken — running after would
+ * still be correct, but burning a connection per rejected call is a free denial-of-service vector.
  *
- * **Advice ordering.** Ordered ahead of Spring's transaction advice
- * (`@EnableTransactionManagement` defaults to [Ordered.LOWEST_PRECEDENCE]), so a
- * cross-tenant call is rejected before a transaction is opened and before the database
- * is touched at all. Running after would still be correct — the transaction would roll
- * back — but it would burn a pooled connection on every rejected call, which is a free
- * denial-of-service vector.
- *
- * **Self-invocation.** Spring AOP proxies the bean, so `this.annotatedMethod()` from
- * inside the same class bypasses the proxy entirely and this advice does not run. We do
- * not paper over it with `AopContext.currentProxy()` or load-time weaving; instead the
- * annotated methods are genuine entry points called from other beans, and
- * `TenantGuardAspectTest` proves both that the aspect fires through the proxy and that
- * row-level security still blocks the data when self-invocation skips it.
- *
- * **Async propagation.** A [ThreadLocal] does not cross a thread-pool boundary. The
- * outbox worker re-establishes the scope from the tenant on the claimed row via
- * [TenantContext.runAs]; `TenantAwareTaskDecorator` does the same for `@Async` work.
- * Nothing is inherited implicitly.
+ * Self-invocation bypasses the proxy and this advice, and is not papered over with
+ * `AopContext.currentProxy()`: annotated methods are genuine entry points, and
+ * `TenantGuardAspectTest` proves row-level security still blocks the data when it is skipped.
+ * Likewise the [ThreadLocal] does not cross a thread pool — the outbox worker and
+ * `TenantAwareTaskDecorator` re-establish the scope explicitly, never implicitly.
  */
 @Aspect
 @Component
@@ -63,11 +50,8 @@ class TenantGuardAspect {
     }
 
     /**
-     * Extracts the argument annotated [TenantScoped], if the method declares one.
-     *
-     * Returns `null` when the method has no such parameter: many operations derive the
-     * tenant entirely from the context, and requiring an explicit parameter everywhere
-     * would be noise.
+     * The argument annotated [TenantScoped], or `null` when the method declares none: many
+     * operations derive the tenant entirely from the context.
      */
     private fun tenantArgumentOf(joinPoint: JoinPoint): TenantId? {
         val method = (joinPoint.signature as? MethodSignature)?.method ?: return null
@@ -79,8 +63,8 @@ class TenantGuardAspect {
             return when (val argument = joinPoint.args.getOrNull(index)) {
                 is TenantId -> argument
                 is String -> TenantId.ofNullable(argument)
-                // A @TenantScoped parameter of some other type is a wiring mistake.
-                // Fail rather than silently skipping the check that annotation promises.
+                // Another type is a wiring mistake: fail rather than silently skipping the
+                // check the annotation promises.
                 null -> null
                 else -> throw IllegalStateException(
                     "@TenantScoped parameter at index $index of " +
@@ -94,9 +78,8 @@ class TenantGuardAspect {
 
     companion object {
         /**
-         * Ahead of transaction advice, which sits at [Ordered.LOWEST_PRECEDENCE].
-         * Not [Ordered.HIGHEST_PRECEDENCE] itself, to leave room for infrastructure
-         * advice (tracing, metrics) that legitimately belongs further out.
+         * Ahead of transaction advice, but not [Ordered.HIGHEST_PRECEDENCE], leaving room for
+         * infrastructure advice (tracing, metrics) that belongs further out.
          */
         const val ORDER: Int = Ordered.HIGHEST_PRECEDENCE + 100
     }

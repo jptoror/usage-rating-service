@@ -5,10 +5,8 @@ import java.math.RoundingMode
 import java.util.Currency
 
 /**
- * A billable quantity.
- *
- * [BigDecimal] rather than [Int]: usage is not always whole units, and a quantity
- * that silently truncates is a quantity that bills the wrong amount.
+ * A billable quantity. [BigDecimal] rather than [Int]: usage is not always whole units, and a
+ * quantity that silently truncates bills the wrong amount.
  */
 @JvmInline
 value class Quantity(val value: BigDecimal) {
@@ -32,11 +30,8 @@ value class Quantity(val value: BigDecimal) {
 }
 
 /**
- * A price per unit.
- *
- * Kept at [SCALE] digits and **never rounded**: only amounts are rounded, and only
- * once. Rounding a unit price would compound the error across every transaction that
- * uses it.
+ * A price per unit, kept at [SCALE] digits and never rounded: rounding it would compound the
+ * error across every transaction that uses it. Only amounts are rounded, and only once.
  */
 @JvmInline
 value class UnitPrice(val value: BigDecimal) {
@@ -52,15 +47,9 @@ value class UnitPrice(val value: BigDecimal) {
 }
 
 /**
- * A monetary amount with its currency.
- *
- * Amounts are held at [SCALE] and rounded [HALF_UP] exactly once, when the amount is
- * produced. Arithmetic here never rounds again, so a total is the sum of amounts that
- * were each rounded when they were calculated. That is what makes an invoice total
- * reconcile exactly with its lines, and each line with its event.
- *
- * `Double` is unusable for this: `0.1 + 0.2 != 0.3` in binary floating point, and an
- * invoice that is off by a fraction of a cent is an invoice a reviewer will find.
+ * A monetary amount with its currency, held at [SCALE] and rounded [HALF_UP] exactly once when
+ * produced. Arithmetic here never rounds again, which is what makes an invoice total reconcile
+ * exactly with its lines and each line with its event. `Double` is unusable: `0.1 + 0.2 != 0.3`.
  */
 data class Money(val amount: BigDecimal, val currency: Currency) : Comparable<Money> {
 
@@ -86,11 +75,8 @@ data class Money(val amount: BigDecimal, val currency: Currency) : Comparable<Mo
     fun isNegative(): Boolean = amount.signum() < 0
 
     /**
-     * Compares by value, ignoring scale.
-     *
-     * `BigDecimal.equals` treats `2.0` and `2.00` as different, which is almost never
-     * what billing code means. [compareTo] is the correct comparison and this class
-     * exposes it deliberately.
+     * Compares by value, ignoring scale: `BigDecimal.equals` treats `2.0` and `2.00` as
+     * different, which is almost never what billing code means.
      */
     override fun compareTo(other: Money): Int {
         requireSameCurrency(other)
@@ -116,10 +102,7 @@ data class Money(val amount: BigDecimal, val currency: Currency) : Comparable<Mo
 
         fun of(amount: String, currency: Currency): Money = of(BigDecimal(amount), currency)
 
-        /**
-         * The single place a rated amount is produced, and therefore the single place
-         * rounding happens. Multiplication is exact; the result is rounded once.
-         */
+        /** The single place a rated amount is produced: exact multiply, rounded once. */
         fun rate(quantity: Quantity, unitPrice: UnitPrice, currency: Currency): Money =
             of(quantity.value.multiply(unitPrice.value), currency)
 

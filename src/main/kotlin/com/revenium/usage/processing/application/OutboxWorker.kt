@@ -1,15 +1,19 @@
 package com.revenium.usage.processing.application
 
-import com.revenium.usage.processing.domain.InstanceId
-import com.revenium.usage.processing.domain.OutboxMessage
+import com.revenium.usage.processing.domain.model.InstanceId
+import com.revenium.usage.processing.domain.model.OutboxMessage
+import com.revenium.usage.processing.domain.port.`in`.DrainOutboxUseCase
+import com.revenium.usage.processing.domain.port.out.OutboxMessageStore
 import com.revenium.usage.processing.infrastructure.ClaimedWork
 import com.revenium.usage.processing.infrastructure.OutboxClaimRepository
-import com.revenium.usage.processing.infrastructure.OutboxMessageRepository
 import com.revenium.usage.rating.application.ConcurrentRatingException
 import com.revenium.usage.rating.application.RatingService
-import com.revenium.usage.rating.domain.RateableTransaction
-import com.revenium.usage.rating.domain.RatingOutcome
+import com.revenium.usage.rating.domain.model.RateableTransaction
+import com.revenium.usage.rating.domain.model.RatingOutcome
 import com.revenium.usage.tenancy.TenantContext
+import com.revenium.usage.shared.domain.CustomerId
+import com.revenium.usage.shared.domain.Quantity
+import com.revenium.usage.shared.domain.TransactionCode
 import com.revenium.usage.tenancy.TenantId
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.springframework.boot.context.properties.ConfigurationProperties
@@ -24,11 +28,9 @@ private val log = KotlinLogging.logger {}
 @ConfigurationProperties("outbox")
 data class OutboxProperties(
     /**
-     * How often a worker asks for work.
-     *
-     * This, not per-message cost, is what bounds rating throughput: `batchSize /
-     * pollInterval` is a hard ceiling. At the original 1s it was 50 events/s and the
-     * workers were idle rather than saturated. See docs/analysis/performance.md.
+     * How often a worker asks for work. This, not per-message cost, bounds throughput:
+     * `batchSize / pollInterval` is a hard ceiling, 50 events/s at the original 1s.
+     * See docs/analysis/performance.md.
      */
     val pollInterval: Duration = Duration.ofMillis(200),
     val batchSize: Int = 200,
@@ -43,34 +45,13 @@ data class OutboxProperties(
 /**
  * Drains the outbox: claims work, rates it, records the outcome.
  *
- * ### Multi-instance coordination
+ * Any number of instances may run this concurrently; coordination is entirely
+ * `FOR UPDATE SKIP LOCKED` in the claim query.
  *
- * Any number of instances may run this concurrently. Coordination is entirely in
- * PostgreSQL, through `FOR UPDATE SKIP LOCKED` in the claim query: each worker takes a
- * disjoint batch, with no leader election, no distributed lock and no broker.
- *
- * ### Tenant propagation
- *
- * The claim runs **unscoped**, because work has to be discovered across tenants, and a
- * narrow RLS policy permits exactly that and nothing else — an unscoped connection can
- * see queue rows and read events, but cannot write a charge.
- *
- * Every message is then processed inside `TenantContext.runAs(...)` using the tenant
- * recorded on its own row. Nothing is inherited from the polling thread: a `ThreadLocal`
- * does not cross a thread boundary, and a tenant inherited by accident would be far
- * worse than none.
- *
- * ### Failure handling
- *
- * Each message is rated in its own transaction, so one failure never rolls back the
- * batch. Outcomes:
- *
- * - **Rated / AlreadyRated** → `DONE`.
- * - **Unrated** → retried on a slow cadence and **not** counted as an attempt: a missing
- *   pricing rule is a configuration gap, and the rule may be created tomorrow.
- * - **Quarantined** → held for a human. Terminal, but not a failure.
- * - **Exception** → retried with exponential backoff, then dead-lettered as `FAILED`.
- *   Nothing is ever discarded.
+ * The claim runs unscoped because work must be discovered across tenants — a narrow RLS policy
+ * permits exactly that and nothing else — and each message is then processed inside
+ * `TenantContext.runAs(...)` with the tenant from its own row, in its own transaction so one
+ * failure never rolls back a batch.
  */
 @Component
 class OutboxWorker(
@@ -79,17 +60,13 @@ class OutboxWorker(
     private val status: OutboxStatusRecorder,
     private val properties: OutboxProperties,
     private val clock: Clock,
-    // Injected rather than defaulted: a default value on a constructor Spring wires
-    // makes Kotlin emit a synthetic DefaultConstructorMarker parameter, which Spring
-    // then tries to resolve as a bean and fails at startup.
+    // Injected rather than defaulted: a default on a Spring-wired constructor makes Kotlin
+    // emit a synthetic DefaultConstructorMarker parameter Spring fails to resolve at startup.
     private val instanceId: InstanceId,
-) {
+) : DrainOutboxUseCase {
 
-    /**
-     * One polling cycle. Returns how many messages were processed, which the tests use
-     * to drive the worker deterministically instead of waiting on the scheduler.
-     */
-    fun pollOnce(): Int {
+    /** One polling cycle, returning the count so tests can drive it without the scheduler. */
+    override fun pollOnce(): Int {
         val now = clock.instant()
         claims.reclaimStale(now, properties.staleClaimTimeout)
 
@@ -102,8 +79,7 @@ class OutboxWorker(
     }
 
     private fun process(work: ClaimedWork) {
-        // Explicit, per-message tenant scope, taken from the claimed row -- never
-        // inherited from whatever this pool thread did previously.
+        // Tenant taken from the claimed row, never inherited from this pool thread's last use.
         TenantContext.runAs(TenantId(work.tenantId)) {
             try {
                 when (val outcome = ratingService.rate(work.toRateable())) {
@@ -137,20 +113,15 @@ class OutboxWorker(
         }
     }
 
-    /**
-     * Maps a claimed queue row into the shape rating defines.
-     *
-     * The mapping lives here, in the consumer, so rating stays independent of how the
-     * work happened to be discovered.
-     */
+    /** Mapped here, in the consumer, so rating stays independent of how work was discovered. */
     private fun ClaimedWork.toRateable() = RateableTransaction(
-        tenantId = tenantId,
+        tenantId = TenantId(tenantId),
         rawEventId = rawEventId,
-        customerId = customerId,
-        transactionCode = transactionCode,
+        customerId = CustomerId(customerId),
+        transactionCode = TransactionCode(transactionCode),
         occurredAt = occurredAt,
         receivedAt = receivedAt,
-        quantity = quantity,
+        quantity = Quantity(quantity),
     )
 
     private fun markDone(work: ClaimedWork) = status.markDone(work)
@@ -163,21 +134,16 @@ class OutboxWorker(
 }
 
 /**
- * Records the outcome of processing a message, each write in its own transaction.
+ * Records the outcome of processing a message, each write in its own transaction: the outcome
+ * must be durable whether or not the rating transaction rolled back, or a failed rating leaves
+ * the message stuck in `PROCESSING` with nothing recording why.
  *
- * A separate bean, not private methods on the worker. `@Transactional` is proxy-based,
- * so calling these through `this` from inside `OutboxWorker` would bypass the proxy
- * entirely and the `REQUIRES_NEW` would silently do nothing — the same self-invocation
- * limitation `TenantGuardAspect` documents, and just as easy to write by accident.
- *
- * The separate transaction matters here: the rating transaction has already committed or
- * rolled back by the time this runs, and the outcome must be durable either way. A status
- * update that rolled back with a failed rating would leave the message stuck in
- * `PROCESSING` with nothing recording why.
+ * A separate bean because `@Transactional` is proxy-based: self-invocation from `OutboxWorker`
+ * would make `REQUIRES_NEW` silently do nothing.
  */
 @Component
 class OutboxStatusRecorder(
-    private val messages: OutboxMessageRepository,
+    private val messages: OutboxMessageStore,
     private val properties: OutboxProperties,
     private val clock: Clock,
 ) {
@@ -203,13 +169,12 @@ class OutboxStatusRecorder(
         )
     }
 
-    private fun update(work: ClaimedWork, mutate: (OutboxMessage) -> Unit) {
-        val message = messages.findByTenantIdAndRawEventId(work.tenantId, work.rawEventId)
+    private fun update(work: ClaimedWork, transition: (OutboxMessage) -> OutboxMessage) {
+        val message = messages.findByRawEventId(TenantId(work.tenantId), work.rawEventId)
         if (message == null) {
             log.warn { "Outbox message for event ${work.rawEventId} vanished before its status was recorded" }
             return
         }
-        mutate(message)
-        messages.save(message)
+        messages.save(transition(message))
     }
 }

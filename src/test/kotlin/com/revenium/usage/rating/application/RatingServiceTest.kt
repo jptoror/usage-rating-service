@@ -1,16 +1,18 @@
 package com.revenium.usage.rating.application
 
-import com.revenium.usage.invoicing.domain.BillingPeriodStatusLookup
-import com.revenium.usage.pricing.domain.PricingRule
-import com.revenium.usage.pricing.domain.PricingRuleLookup
-import com.revenium.usage.rating.domain.RateableTransaction
-import com.revenium.usage.rating.domain.RatedTransaction
-import com.revenium.usage.rating.domain.RatingCalculator
-import com.revenium.usage.rating.domain.RatingOutcome
-import com.revenium.usage.rating.infrastructure.RatedTransactionRepository
+import com.revenium.usage.invoicing.domain.port.out.BillingPeriodStatusLookup
+import com.revenium.usage.pricing.domain.model.PricingRule
+import com.revenium.usage.pricing.domain.port.out.PricingRuleLookup
+import com.revenium.usage.rating.domain.model.RateableTransaction
+import com.revenium.usage.rating.domain.model.RatedTransaction
+import com.revenium.usage.rating.domain.model.RatingCalculator
+import com.revenium.usage.rating.domain.model.RatingOutcome
+import com.revenium.usage.rating.domain.port.out.RatedTransactionStore
 import com.revenium.usage.shared.domain.BillingPeriod
 import com.revenium.usage.shared.domain.CustomerId
+import com.revenium.usage.shared.domain.Quantity
 import com.revenium.usage.shared.domain.TransactionCode
+import com.revenium.usage.shared.domain.UnitPrice
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
 import io.mockk.every
@@ -25,6 +27,7 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
+import java.util.Currency
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
@@ -37,10 +40,10 @@ class RatingServiceTest {
     private val tenant = TenantId("tenant-a")
 
     private val rule = PricingRule(
-        tenantId = "tenant-a",
-        transactionCode = "VEHICLE_REGISTRATION",
-        unitPrice = BigDecimal("2.000000"),
-        currency = "USD",
+        tenantId = TenantId("tenant-a"),
+        transactionCode = TransactionCode("VEHICLE_REGISTRATION"),
+        unitPrice = UnitPrice(BigDecimal("2.000000")),
+        currency = Currency.getInstance("USD"),
         effectiveFrom = Instant.parse("2026-01-01T00:00:00Z"),
         id = 7L,
     )
@@ -48,11 +51,14 @@ class RatingServiceTest {
     private val pricingRules = object : PricingRuleLookup {
         override fun findApplicable(tenant: TenantId, code: TransactionCode, occurredAt: Instant) =
             rule.takeIf { it.appliesAt(occurredAt) }
+
+        override fun findAllFor(tenant: TenantId) = listOf(rule)
+
+        override fun findById(tenant: TenantId, id: Long) = rule.takeIf { it.id == id }
     }
 
-    private val ratedTransactions = mockk<RatedTransactionRepository> {
+    private val ratedTransactions = mockk<RatedTransactionStore> {
         every { save(any()) } answers { firstArg() }
-        every { saveAndFlush(any()) } answers { firstArg() }
     }
     private val billingPeriods = mockk<BillingPeriodStatusLookup> {
         every { isClosed(any(), any(), any()) } returns false
@@ -69,16 +75,16 @@ class RatingServiceTest {
     fun cleanUp() = TenantContext.clear()
 
     private fun work(tenantId: String = "tenant-a") = RateableTransaction(
-        tenantId = tenantId,
+        tenantId = TenantId(tenantId),
         rawEventId = 1L,
-        customerId = "customer-42",
-        transactionCode = "VEHICLE_REGISTRATION",
+        customerId = CustomerId("customer-42"),
+        transactionCode = TransactionCode("VEHICLE_REGISTRATION"),
         occurredAt = Instant.parse("2026-08-15T14:22:31Z"),
         receivedAt = Instant.parse("2026-08-15T14:25:00Z"),
-        quantity = BigDecimal("2"),
+        quantity = Quantity(BigDecimal("2")),
     )
 
-    private fun notYetRated() = every { ratedTransactions.findCurrentByRawEventId(any(), any()) } returns null
+    private fun notYetRated() = every { ratedTransactions.findCurrent(any(), any()) } returns null
 
     @Test
     fun `persists both the rule id and the price it had at the time`() {
@@ -86,25 +92,25 @@ class RatingServiceTest {
         // after the rule is corrected.
         notYetRated()
         val persisted = slot<RatedTransaction>()
-        every { ratedTransactions.saveAndFlush(capture(persisted)) } answers { firstArg() }
+        every { ratedTransactions.save(capture(persisted)) } answers { firstArg() }
 
         TenantContext.runAs(tenant) { service.rate(work()) }
 
         assertEquals(7L, persisted.captured.pricingRuleId)
-        assertEquals(0, persisted.captured.unitPrice.compareTo(BigDecimal("2.000000")))
-        assertEquals("4.0000", persisted.captured.amount.toPlainString())
+        assertEquals(0, persisted.captured.unitPrice.value.compareTo(BigDecimal("2.000000")))
+        assertEquals("4.0000", persisted.captured.amount.amount.toPlainString())
     }
 
     @Test
     fun `records both the origin period and the billing period`() {
         notYetRated()
         val persisted = slot<RatedTransaction>()
-        every { ratedTransactions.saveAndFlush(capture(persisted)) } answers { firstArg() }
+        every { ratedTransactions.save(capture(persisted)) } answers { firstArg() }
 
         TenantContext.runAs(tenant) { service.rate(work()) }
 
-        assertEquals("2026-08-01", persisted.captured.originPeriod.toString())
-        assertEquals("2026-08-01", persisted.captured.billingPeriod.toString())
+        assertEquals("2026-08", persisted.captured.originPeriod.toString())
+        assertEquals("2026-08", persisted.captured.billingPeriod.toString())
         assertEquals(false, persisted.captured.isLateAdjustment)
     }
 
@@ -113,26 +119,26 @@ class RatingServiceTest {
         notYetRated()
         every { billingPeriods.isClosed(any(), any(), BillingPeriod.parse("2026-08")) } returns true
         val persisted = slot<RatedTransaction>()
-        every { ratedTransactions.saveAndFlush(capture(persisted)) } answers { firstArg() }
+        every { ratedTransactions.save(capture(persisted)) } answers { firstArg() }
 
         TenantContext.runAs(tenant) { service.rate(work()) }
 
         // The closed invoice is untouched; the charge lands in September, traceable back.
-        assertEquals("2026-08-01", persisted.captured.originPeriod.toString())
-        assertEquals("2026-09-01", persisted.captured.billingPeriod.toString())
+        assertEquals("2026-08", persisted.captured.originPeriod.toString())
+        assertEquals("2026-09", persisted.captured.billingPeriod.toString())
         assertTrue(persisted.captured.isLateAdjustment)
     }
 
     @Test
     fun `skips work that is already rated`() {
         // At-least-once delivery means this happens routinely; it is not an error.
-        every { ratedTransactions.findCurrentByRawEventId(tenant.value, 1L) } returns
+        every { ratedTransactions.findCurrent(tenant, 1L) } returns
             mockk<RatedTransaction> { every { id } returns 99L }
 
         val outcome = TenantContext.runAs(tenant) { service.rate(work()) }
 
         assertEquals(99L, assertIs<RatingOutcome.AlreadyRated>(outcome).ratedTransactionId)
-        verify(exactly = 0) { ratedTransactions.saveAndFlush(any()) }
+        verify(exactly = 0) { ratedTransactions.save(any()) }
     }
 
     @Test
@@ -141,7 +147,7 @@ class RatingServiceTest {
         // refused the second charge. That is the unique index doing its job, and the
         // caller needs to tell it apart from a genuine failure.
         notYetRated()
-        every { ratedTransactions.saveAndFlush(any()) } throws
+        every { ratedTransactions.save(any()) } throws
             DataIntegrityViolationException("uq_rated_transaction_current")
 
         assertFailsWith<ConcurrentRatingException> {
@@ -156,7 +162,7 @@ class RatingServiceTest {
         // charge vanished with nothing recording why. Only the unique index on the
         // current rating means someone else won.
         notYetRated()
-        every { ratedTransactions.saveAndFlush(any()) } throws
+        every { ratedTransactions.save(any()) } throws
             DataIntegrityViolationException("violates check constraint \"ck_rated_late_adjustment_consistent\"")
 
         // Propagated as-is, so the worker retries and eventually dead-letters it rather
@@ -174,7 +180,7 @@ class RatingServiceTest {
         }
 
         assertIs<RatingOutcome.Unrated>(outcome)
-        verify(exactly = 0) { ratedTransactions.saveAndFlush(any()) }
+        verify(exactly = 0) { ratedTransactions.save(any()) }
     }
 
     @Test

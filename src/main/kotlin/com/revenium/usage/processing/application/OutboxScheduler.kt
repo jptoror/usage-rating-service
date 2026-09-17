@@ -1,5 +1,6 @@
 package com.revenium.usage.processing.application
 
+import com.revenium.usage.processing.domain.port.`in`.DrainOutboxUseCase
 import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.annotation.PreDestroy
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
@@ -30,7 +31,7 @@ private val log = KotlinLogging.logger {}
  */
 @Component
 @ConditionalOnProperty(name = ["outbox.scheduler-enabled"], havingValue = "true", matchIfMissing = true)
-class OutboxScheduler(private val worker: OutboxWorker) {
+class OutboxScheduler(private val worker: DrainOutboxUseCase) {
 
     private val running = AtomicBoolean(true)
 

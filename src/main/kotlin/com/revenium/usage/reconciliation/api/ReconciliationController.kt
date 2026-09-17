@@ -1,6 +1,6 @@
 package com.revenium.usage.reconciliation.api
 
-import com.revenium.usage.reconciliation.application.ReconciliationService
+import com.revenium.usage.reconciliation.domain.port.`in`.ReconcileUseCase
 import com.revenium.usage.reconciliation.domain.ReconciliationLine
 import com.revenium.usage.reconciliation.domain.ReconciliationReport
 import com.revenium.usage.shared.domain.BillingPeriod
@@ -67,7 +67,7 @@ data class ReconciliationLineResponse(
 @RestController
 @RequestMapping("/api/v1/reconciliation")
 @Tag(name = "Reconciliation", description = "Evidence linking received events to billed amounts")
-class ReconciliationController(private val reconciliationService: ReconciliationService) {
+class ReconciliationController(private val reconciliationService: ReconcileUseCase) {
 
     @GetMapping("/report")
     @Operation(

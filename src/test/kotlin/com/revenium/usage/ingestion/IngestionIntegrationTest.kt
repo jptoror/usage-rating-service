@@ -1,13 +1,13 @@
 package com.revenium.usage.ingestion
 
 import com.revenium.usage.ingestion.application.IngestionService
-import com.revenium.usage.ingestion.domain.IngestionResult
-import com.revenium.usage.ingestion.domain.RawTransactionInput
-import com.revenium.usage.ingestion.infrastructure.EventConflictRepository
-import com.revenium.usage.ingestion.infrastructure.RawEventRepository
-import com.revenium.usage.ingestion.infrastructure.RejectedEventRepository
-import com.revenium.usage.processing.domain.OutboxStatus
-import com.revenium.usage.processing.infrastructure.OutboxMessageRepository
+import com.revenium.usage.ingestion.domain.model.IngestionResult
+import com.revenium.usage.ingestion.domain.model.RawTransactionInput
+import com.revenium.usage.ingestion.infrastructure.persistence.EventConflictJpaRepository
+import com.revenium.usage.ingestion.infrastructure.persistence.RawEventJpaRepository
+import com.revenium.usage.ingestion.infrastructure.persistence.RejectedEventJpaRepository
+import com.revenium.usage.processing.domain.model.OutboxStatus
+import com.revenium.usage.processing.infrastructure.persistence.OutboxMessageJpaRepository
 import com.revenium.usage.support.IntegrationTest
 import com.revenium.usage.support.PostgresContainerInitializer
 import com.revenium.usage.tenancy.TenantContext
@@ -34,10 +34,10 @@ import kotlin.test.assertTrue
 @IntegrationTest
 class IngestionIntegrationTest(
     @Autowired val ingestionService: IngestionService,
-    @Autowired val rawEvents: RawEventRepository,
-    @Autowired val outbox: OutboxMessageRepository,
-    @Autowired val conflicts: EventConflictRepository,
-    @Autowired val rejectedEvents: RejectedEventRepository,
+    @Autowired val rawEvents: RawEventJpaRepository,
+    @Autowired val outbox: OutboxMessageJpaRepository,
+    @Autowired val conflicts: EventConflictJpaRepository,
+    @Autowired val rejectedEvents: RejectedEventJpaRepository,
     @Autowired val jdbc: JdbcTemplate,
 ) {
 

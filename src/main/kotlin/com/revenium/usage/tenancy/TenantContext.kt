@@ -1,16 +1,12 @@
 package com.revenium.usage.tenancy
 
 /**
- * Holds the tenant a unit of work is executing on behalf of.
+ * Holds the tenant a unit of work is executing on behalf of. Populated by `TenantFilter` at the
+ * HTTP boundary and from the claimed row in the outbox worker.
  *
- * Backed by a plain [ThreadLocal], deliberately **not** an [InheritableThreadLocal]:
- * implicit inheritance into a thread pool is worse than no inheritance at all,
- * because a pooled thread keeps whatever tenant it inherited on its first use and
- * then silently applies it to unrelated work. Asynchronous work re-establishes the
- * context explicitly instead, via [runAs].
- *
- * The context is populated at the HTTP boundary by `TenantFilter`, and in the outbox
- * worker from the tenant stored on the claimed row.
+ * A plain [ThreadLocal], deliberately not [InheritableThreadLocal]: a pooled thread would keep
+ * the tenant it inherited on its first use and silently apply it to unrelated work. Async work
+ * re-establishes the scope explicitly via [runAs].
  */
 object TenantContext {
 
@@ -22,19 +18,15 @@ object TenantContext {
     /**
      * The current tenant.
      *
-     * @throws MissingTenantException when no tenant is in scope. Callers that reach
-     * this point without a tenant have a bug: failing loudly beats defaulting to
+     * @throws MissingTenantException when none is in scope: failing loudly beats defaulting to
      * some tenant and corrupting their data.
      */
     fun current(): TenantId =
         holder.get() ?: throw MissingTenantException("No tenant in scope")
 
     /**
-     * Runs [block] with [tenant] in scope, restoring the previous value afterwards.
-     *
-     * Restores rather than clears, so nesting is safe: an inner scope cannot
-     * silently erase the outer one. The `finally` is what keeps a pooled thread from
-     * carrying a tenant into the next, unrelated task.
+     * Runs [block] with [tenant] in scope. Restores the previous value rather than clearing, so
+     * nesting is safe, and the `finally` keeps a pooled thread from carrying a tenant onward.
      */
     fun <T> runAs(tenant: TenantId, block: () -> T): T {
         val previous = holder.get()

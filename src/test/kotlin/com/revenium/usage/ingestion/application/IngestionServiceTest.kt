@@ -1,15 +1,18 @@
 package com.revenium.usage.ingestion.application
 
 import tools.jackson.databind.ObjectMapper
-import com.revenium.usage.ingestion.domain.EventConflict
-import com.revenium.usage.ingestion.domain.IngestionResult
-import com.revenium.usage.ingestion.domain.RawEvent
-import com.revenium.usage.ingestion.domain.RawTransactionInput
-import com.revenium.usage.ingestion.domain.TransactionValidator
-import com.revenium.usage.ingestion.infrastructure.EventConflictRepository
-import com.revenium.usage.ingestion.infrastructure.RawEventRepository
-import com.revenium.usage.ingestion.infrastructure.RejectedEventRepository
-import com.revenium.usage.ingestion.domain.RatingQueue
+import com.revenium.usage.ingestion.domain.model.EventConflict
+import com.revenium.usage.ingestion.domain.model.IngestionResult
+import com.revenium.usage.ingestion.domain.model.RawEvent
+import com.revenium.usage.ingestion.domain.model.RawTransactionInput
+import com.revenium.usage.ingestion.domain.model.TransactionValidator
+import com.revenium.usage.ingestion.domain.model.RejectedEvent
+import com.revenium.usage.ingestion.domain.port.out.EventStore
+import com.revenium.usage.ingestion.domain.port.out.RatingQueue
+import com.revenium.usage.shared.domain.CustomerId
+import com.revenium.usage.shared.domain.EventId
+import com.revenium.usage.shared.domain.Quantity
+import com.revenium.usage.shared.domain.TransactionCode
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
 import io.mockk.every
@@ -37,31 +40,27 @@ class IngestionServiceTest {
     private val tenant = TenantId("tenant-a")
     private val eventUuid = UUID.fromString("73d4e120-77d0-4f11-a6d2-f3b43b430d9c")
 
-    private val rawEvents = mockk<RawEventRepository> {
+    // One port covering every write ingestion makes. Stubbed explicitly rather than
+    // relaxed: a relaxed mock returns a bare Object, which fails with a
+    // ClassCastException only once the call is actually exercised.
+    private val events = mockk<EventStore> {
         // The duplicate path increments a delivery counter on the existing event, so
         // that an identical re-delivery is still visible to reconciliation.
-        every { save(any()) } answers { firstArg() }
+        every { recordDuplicateDelivery(any()) } answers { firstArg() }
+        every { recordConflict(any()) } answers { firstArg() }
+        every { recordRejection(any()) } answers { firstArg() }
     }
 
-    // Stubbed explicitly rather than relaxed: a relaxed mock of a generic repository
-    // returns a bare Object from save(), which fails with a ClassCastException only
-    // once the call is actually exercised.
     // The port ingestion owns, not the outbox's repository: ingestion states what it
     // needs (enqueue for rating) and processing supplies it.
     private val ratingQueue = mockk<RatingQueue>(relaxed = true)
-    private val conflicts = mockk<EventConflictRepository> {
-        every { save(any()) } answers { firstArg() }
-    }
-    private val rejectedEvents = mockk<RejectedEventRepository> {
-        every { save(any()) } answers { firstArg() }
-    }
     private val objectMapper = ObjectMapper()
 
     private val service = IngestionService(
         validator = TransactionValidator(clock, java.time.Duration.ofMinutes(5)),
-        eventRecorder = EventRecorder(rawEvents, ratingQueue, clock),
-        duplicateResolver = DuplicateResolver(rawEvents, conflicts, clock),
-        rejectionRecorder = RejectionRecorder(rejectedEvents, objectMapper, clock),
+        eventRecorder = EventRecorder(events, ratingQueue, clock),
+        duplicateResolver = DuplicateResolver(events, clock),
+        rejectionRecorder = RejectionRecorder(events, objectMapper, clock),
         clock = clock,
     )
 
@@ -85,12 +84,12 @@ class IngestionServiceTest {
     )
 
     private fun storedEvent(id: Long = 1L, payloadHash: String = "hash-1") = RawEvent(
-        tenantId = tenant.value,
-        eventId = eventUuid,
-        customerId = "customer-42",
-        transactionCode = "VEHICLE_REGISTRATION",
+        tenantId = tenant,
+        eventId = EventId(eventUuid),
+        customerId = CustomerId("customer-42"),
+        transactionCode = TransactionCode("VEHICLE_REGISTRATION"),
         occurredAt = Instant.parse("2026-08-15T14:22:31Z"),
-        quantity = BigDecimal("2"),
+        quantity = Quantity(BigDecimal("2")),
         payload = "{}",
         payloadHash = payloadHash,
         receivedAt = now,
@@ -103,7 +102,7 @@ class IngestionServiceTest {
 
     @Test
     fun `records the event and queues it for rating in one step`() {
-        every { rawEvents.saveAndFlush(any()) } returns storedEvent(id = 42L)
+        every { events.record(any()) } returns storedEvent(id = 42L)
 
         val result = asTenant { service.ingest(input()) }
 
@@ -121,7 +120,7 @@ class IngestionServiceTest {
     @Test
     fun `stores the payload verbatim as evidence`() {
         val persisted = slot<RawEvent>()
-        every { rawEvents.saveAndFlush(capture(persisted)) } returns storedEvent()
+        every { events.record(capture(persisted)) } returns storedEvent()
 
         asTenant { service.ingest(input()) }
 
@@ -132,7 +131,7 @@ class IngestionServiceTest {
     @Test
     fun `stamps receivedAt from the injected clock`() {
         val persisted = slot<RawEvent>()
-        every { rawEvents.saveAndFlush(capture(persisted)) } returns storedEvent()
+        every { events.record(capture(persisted)) } returns storedEvent()
 
         asTenant { service.ingest(input()) }
 
@@ -145,8 +144,8 @@ class IngestionServiceTest {
     fun `treats a constraint violation as a duplicate rather than an error`() {
         // Detection is insert-and-catch, not select-then-insert: a read-then-write has
         // a race window that concurrent delivery of the same event will find.
-        every { rawEvents.saveAndFlush(any()) } throws DataIntegrityViolationException("uq_raw_event_tenant_event")
-        every { rawEvents.findByTenantIdAndEventId(tenant.value, eventUuid) } returns storedEvent(id = 7L)
+        every { events.record(any()) } throws DataIntegrityViolationException("uq_raw_event_tenant_event")
+        every { events.findByEventId(tenant, EventId(eventUuid)) } returns storedEvent(id = 7L)
 
         val result = asTenant { service.ingest(input()) }
 
@@ -160,8 +159,8 @@ class IngestionServiceTest {
     fun `does not queue a second unit of work for a duplicate`() {
         // The invariant behind "no double billing": a re-delivery must not create more
         // rating work.
-        every { rawEvents.saveAndFlush(any()) } throws DataIntegrityViolationException("duplicate")
-        every { rawEvents.findByTenantIdAndEventId(tenant.value, eventUuid) } returns storedEvent()
+        every { events.record(any()) } throws DataIntegrityViolationException("duplicate")
+        every { events.findByEventId(tenant, EventId(eventUuid)) } returns storedEvent()
 
         asTenant { service.ingest(input()) }
 
@@ -170,8 +169,8 @@ class IngestionServiceTest {
 
     @Test
     fun `records a conflict when a duplicate carries a different payload`() {
-        every { rawEvents.saveAndFlush(any()) } throws DataIntegrityViolationException("duplicate")
-        every { rawEvents.findByTenantIdAndEventId(tenant.value, eventUuid) } returns
+        every { events.record(any()) } throws DataIntegrityViolationException("duplicate")
+        every { events.findByEventId(tenant, EventId(eventUuid)) } returns
             storedEvent(id = 7L, payloadHash = "original-hash")
 
         val result = asTenant { service.ingest(input(payloadHash = "different-hash")) }
@@ -181,27 +180,27 @@ class IngestionServiceTest {
         // The first delivery still wins -- billing the second would double-bill -- but
         // the discrepancy is evidence a human needs to see.
         val conflict = slot<EventConflict>()
-        verify(exactly = 1) { conflicts.save(capture(conflict)) }
+        verify(exactly = 1) { events.recordConflict(capture(conflict)) }
         assertEquals("original-hash", conflict.captured.originalPayloadHash)
         assertEquals("different-hash", conflict.captured.conflictingPayloadHash)
     }
 
     @Test
     fun `records no conflict when a duplicate is byte-identical`() {
-        every { rawEvents.saveAndFlush(any()) } throws DataIntegrityViolationException("duplicate")
-        every { rawEvents.findByTenantIdAndEventId(tenant.value, eventUuid) } returns storedEvent(payloadHash = "hash-1")
+        every { events.record(any()) } throws DataIntegrityViolationException("duplicate")
+        every { events.findByEventId(tenant, EventId(eventUuid)) } returns storedEvent(payloadHash = "hash-1")
 
         asTenant { service.ingest(input(payloadHash = "hash-1")) }
 
-        verify(exactly = 0) { conflicts.save(any()) }
+        verify(exactly = 0) { events.recordConflict(any()) }
     }
 
     @Test
     fun `surfaces an integrity violation that is not a duplicate`() {
         // A constraint violation with no matching row is a genuine integrity problem,
         // not a duplicate. Reporting it as a duplicate would hide real corruption.
-        every { rawEvents.saveAndFlush(any()) } throws DataIntegrityViolationException("some other constraint")
-        every { rawEvents.findByTenantIdAndEventId(tenant.value, eventUuid) } returns null
+        every { events.record(any()) } throws DataIntegrityViolationException("some other constraint")
+        every { events.findByEventId(tenant, EventId(eventUuid)) } returns null
 
         assertFailsWith<IllegalStateException> { asTenant { service.ingest(input()) } }
     }
@@ -213,7 +212,7 @@ class IngestionServiceTest {
         val result = asTenant { service.ingest(input(customerId = null)) }
 
         assertIs<IngestionResult.Rejected>(result)
-        verify(exactly = 0) { rawEvents.saveAndFlush(any()) }
+        verify(exactly = 0) { events.record(any()) }
         verify(exactly = 0) { ratingQueue.enqueue(any(), any()) }
     }
 
@@ -223,7 +222,7 @@ class IngestionServiceTest {
         // would leave the reconciliation totals unable to balance.
         asTenant { service.ingest(input(customerId = null)) }
 
-        verify(exactly = 1) { rejectedEvents.save(any()) }
+        verify(exactly = 1) { events.recordRejection(any<RejectedEvent>()) }
     }
 
     @Test
@@ -242,18 +241,18 @@ class IngestionServiceTest {
         assertFailsWith<com.revenium.usage.tenancy.MissingTenantException> {
             service.ingest(input())
         }
-        verify(exactly = 0) { rawEvents.saveAndFlush(any()) }
+        verify(exactly = 0) { events.record(any()) }
     }
 
     @Test
     fun `persists the event under the tenant in scope`() {
         val persisted = slot<RawEvent>()
-        every { rawEvents.saveAndFlush(capture(persisted)) } returns storedEvent()
+        every { events.record(capture(persisted)) } returns storedEvent()
 
         TenantContext.runAs(TenantId("tenant-b")) {
             service.ingest(input().copy(tenantId = "tenant-b"))
         }
 
-        assertEquals("tenant-b", persisted.captured.tenantId)
+        assertEquals("tenant-b", persisted.captured.tenantId.value)
     }
 }

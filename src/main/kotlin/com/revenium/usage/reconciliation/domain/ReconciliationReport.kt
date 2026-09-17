@@ -7,11 +7,9 @@ import java.math.BigDecimal
 import java.time.Instant
 
 /**
- * Where a received event ended up.
- *
- * Every event that arrived is in exactly one of these, which is what lets the report's
- * totals balance. The states are derived from the tables rather than stored on a status
- * column, so there is no second copy of the truth to drift out of sync.
+ * Where a received event ended up. Every event is in exactly one of these, which is what lets
+ * the report's totals balance, and they are derived from the tables rather than stored on a
+ * status column, so there is no second copy of the truth to drift.
  */
 enum class EventState {
     /** Failed validation. Never became billable usage. */
@@ -47,18 +45,11 @@ data class StateCount(
 )
 
 /**
- * Reconciliation evidence for a customer and period.
- *
- * The report exists to answer one question — *does what we received account for what we
- * billed?* — and it answers it with arithmetic a reviewer can check by hand:
- *
- * ```
- * received  = accepted + duplicates + rejected
- * accepted  = rated + invoiced + unrated + failed + quarantined
- * ```
- *
- * [isBalanced] evaluates exactly those identities. When one fails there is a defect, and
- * the report says so rather than presenting plausible-looking numbers.
+ * Reconciliation evidence for a customer and period: does what we received account for what we
+ * billed? [isBalanced] evaluates two identities a reviewer can check by hand —
+ * `received = accepted + duplicates + rejected` and
+ * `accepted = rated + invoiced + unrated + failed + quarantined` — and says so when one fails,
+ * rather than presenting plausible-looking numbers.
  */
 data class ReconciliationReport(
     val customerId: CustomerId,
@@ -71,12 +62,7 @@ data class ReconciliationReport(
 
     fun countOf(state: EventState): Long = states.firstOrNull { it.state == state }?.count ?: 0
 
-    /**
-     * Whether the identities above hold.
-     *
-     * A reviewer should never have to trust this: [imbalanceDescription] prints both
-     * sides of any equation that failed.
-     */
+    /** Whether the identities above hold; [imbalanceDescription] prints both sides when not. */
     val isBalanced: Boolean
         get() = receivedCount == accepted + countOf(EventState.DUPLICATE) + countOf(EventState.REJECTED) &&
             accepted == ratedOrBilled + unresolved
@@ -101,11 +87,8 @@ data class ReconciliationReport(
 }
 
 /**
- * One rated transaction, traced back to the event and rule behind it.
- *
- * This is the row a reviewer lands on when following a total downwards, so it carries
- * everything needed to re-derive the amount by hand: `quantity x unitPrice`, the rule
- * that supplied the price, and the event id the figure came from.
+ * One rated transaction, carrying everything needed to re-derive the amount by hand:
+ * `quantity x unitPrice`, the rule that supplied the price, and the originating event id.
  */
 data class ReconciliationLine(
     val eventId: String,

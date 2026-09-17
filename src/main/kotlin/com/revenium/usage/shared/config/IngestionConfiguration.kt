@@ -1,6 +1,6 @@
 package com.revenium.usage.shared.config
 
-import com.revenium.usage.ingestion.domain.TransactionValidator
+import com.revenium.usage.ingestion.domain.model.TransactionValidator
 import org.springframework.boot.context.properties.ConfigurationProperties
 import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Bean

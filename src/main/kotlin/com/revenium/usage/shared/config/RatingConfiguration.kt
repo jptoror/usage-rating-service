@@ -1,8 +1,8 @@
 package com.revenium.usage.shared.config
 
-import com.revenium.usage.pricing.domain.PricingRuleLookup
+import com.revenium.usage.pricing.domain.port.out.PricingRuleLookup
 import com.revenium.usage.processing.application.OutboxProperties
-import com.revenium.usage.rating.domain.RatingCalculator
+import com.revenium.usage.rating.domain.model.RatingCalculator
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.context.properties.ConfigurationProperties
 import org.springframework.boot.context.properties.EnableConfigurationProperties
@@ -65,6 +65,6 @@ class RatingConfiguration {
     @Bean
     fun instanceId(
         @Value("\${INSTANCE_ID:}") override: String,
-    ): com.revenium.usage.processing.domain.InstanceId =
-        com.revenium.usage.processing.domain.InstanceId.detect(override.ifBlank { null })
+    ): com.revenium.usage.processing.domain.model.InstanceId =
+        com.revenium.usage.processing.domain.model.InstanceId.detect(override.ifBlank { null })
 }

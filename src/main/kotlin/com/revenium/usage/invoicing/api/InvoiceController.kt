@@ -1,7 +1,8 @@
 package com.revenium.usage.invoicing.api
 
-import com.revenium.usage.invoicing.application.InvoiceService
-import com.revenium.usage.invoicing.domain.InvoiceSummary
+import com.revenium.usage.invoicing.domain.model.InvoiceSummary
+import com.revenium.usage.invoicing.domain.port.`in`.ClosePeriodUseCase
+import com.revenium.usage.invoicing.domain.port.`in`.SummariseInvoiceUseCase
 import com.revenium.usage.shared.domain.BillingPeriod
 import com.revenium.usage.shared.domain.CustomerId
 import io.swagger.v3.oas.annotations.Operation
@@ -48,7 +49,10 @@ data class InvoiceSummaryResponse(
 @RestController
 @RequestMapping("/api/v1/invoices")
 @Tag(name = "Invoices", description = "Invoice summaries and period close")
-class InvoiceController(private val invoiceService: InvoiceService) {
+class InvoiceController(
+    private val summarise: SummariseInvoiceUseCase,
+    private val closePeriod: ClosePeriodUseCase,
+) {
 
     @GetMapping("/summary")
     @Operation(
@@ -71,7 +75,7 @@ class InvoiceController(private val invoiceService: InvoiceService) {
         @RequestParam period: String,
     ): ResponseEntity<InvoiceSummaryResponse> =
         ResponseEntity.ok(
-            invoiceService.summarise(CustomerId(customerId), BillingPeriod.parse(period)).toResponse()
+            summarise.summarise(CustomerId(customerId), BillingPeriod.parse(period)).toResponse()
         )
 
     @PostMapping("/close")
@@ -92,7 +96,7 @@ class InvoiceController(private val invoiceService: InvoiceService) {
         @RequestParam period: String,
     ): ResponseEntity<InvoiceSummaryResponse> =
         ResponseEntity.ok(
-            invoiceService.closePeriod(CustomerId(customerId), BillingPeriod.parse(period)).toResponse()
+            closePeriod.closePeriod(CustomerId(customerId), BillingPeriod.parse(period)).toResponse()
         )
 }
 
@@ -103,9 +107,9 @@ internal fun InvoiceSummary.toResponse() = InvoiceSummaryResponse(
     status = status.name,
     lines = lines.map {
         SummaryLineResponse(
-            transactionCode = it.transactionCode,
+            transactionCode = it.transactionCode.value,
             transactionCount = it.transactionCount,
-            totalQuantity = it.totalQuantity,
+            totalQuantity = it.totalQuantity.value,
             amount = it.amount.amount,
             originPeriod = it.originPeriod.toString(),
             isAdjustment = it.isAdjustment,

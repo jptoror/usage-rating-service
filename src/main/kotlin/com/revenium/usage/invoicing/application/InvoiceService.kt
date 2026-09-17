@@ -1,17 +1,19 @@
 package com.revenium.usage.invoicing.application
 
-import com.revenium.usage.invoicing.domain.Invoice
-import com.revenium.usage.invoicing.domain.InvoiceLine
-import com.revenium.usage.invoicing.domain.InvoiceStatus
-import com.revenium.usage.invoicing.domain.InvoiceSummary
-import com.revenium.usage.invoicing.domain.SummaryLine
-import com.revenium.usage.invoicing.infrastructure.InvoiceJpaRepository
-import com.revenium.usage.invoicing.infrastructure.InvoiceLineJpaRepository
-import com.revenium.usage.invoicing.domain.Charge
-import com.revenium.usage.invoicing.domain.ChargeLookup
+import com.revenium.usage.invoicing.domain.model.Charge
+import com.revenium.usage.invoicing.domain.model.Invoice
+import com.revenium.usage.invoicing.domain.model.InvoiceLine
+import com.revenium.usage.invoicing.domain.model.InvoiceStatus
+import com.revenium.usage.invoicing.domain.model.InvoiceSummary
+import com.revenium.usage.invoicing.domain.model.SummaryLine
+import com.revenium.usage.invoicing.domain.port.`in`.ClosePeriodUseCase
+import com.revenium.usage.invoicing.domain.port.`in`.SummariseInvoiceUseCase
+import com.revenium.usage.invoicing.domain.port.out.ChargeLookup
+import com.revenium.usage.invoicing.domain.port.out.InvoiceStore
 import com.revenium.usage.shared.domain.BillingPeriod
 import com.revenium.usage.shared.domain.CustomerId
 import com.revenium.usage.shared.domain.Money
+import com.revenium.usage.shared.domain.Quantity
 import com.revenium.usage.tenancy.RequiresTenant
 import com.revenium.usage.tenancy.TenantContext
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -28,42 +30,29 @@ private val log = KotlinLogging.logger {}
 /**
  * Produces invoice summaries and closes billing periods.
  *
- * ### On-read while open, materialised on close
- *
- * An open period is aggregated from `rated_transaction` every time it is asked for, so
- * the summary always reflects the latest rating with no cache to invalidate and no
- * recomputation step to schedule. Closing freezes the figures into `invoice` and
- * `invoice_line`, and from then on the closed invoice is read back verbatim.
- *
- * That split is what makes the late-arrival policy work: nothing recomputes a closed
- * period, so a customer never sees a figure change after the fact.
+ * An open period is aggregated from the rated charges on every read — no cache to invalidate —
+ * while closing freezes the figures into the invoice and its lines, read back verbatim
+ * thereafter. That split is what makes the late-arrival policy work: nothing recomputes a
+ * closed period, so a customer never sees a figure change after the fact.
  */
 @Service
 @RequiresTenant
 class InvoiceService(
     private val charges: ChargeLookup,
-    private val invoices: InvoiceJpaRepository,
-    private val invoiceLines: InvoiceLineJpaRepository,
+    private val invoices: InvoiceStore,
     private val defaultCurrency: Currency,
     private val clock: Clock,
-) {
+) : SummariseInvoiceUseCase, ClosePeriodUseCase {
 
-    /**
-     * The summary for a customer and period.
-     *
-     * `readOnly` so the driver can skip dirty checking and the database knows no writes
-     * are coming — meaningful on a query that may scan a month of transactions.
-     */
+    /** `readOnly`: no dirty checking, on a query that may scan a month of transactions. */
     @Transactional(readOnly = true)
-    fun summarise(customer: CustomerId, period: BillingPeriod): InvoiceSummary {
+    override fun summarise(customer: CustomerId, period: BillingPeriod): InvoiceSummary {
         val tenant = TenantContext.current()
-        val existing = invoices.findByTenantIdAndCustomerIdAndPeriodStart(
-            tenant.value, customer.value, period.startDate,
-        )
+        val existing = invoices.findInvoice(tenant, customer, period)
 
         return if (existing?.status == InvoiceStatus.CLOSED) {
-            // A closed invoice is read back exactly as it was frozen. Re-aggregating
-            // would risk reporting a different figure than the one already billed.
+            // Read back exactly as frozen: re-aggregating could report a different figure
+            // than the one already billed.
             summariseFromClosedInvoice(existing, customer, period)
         } else {
             summariseFromRatedTransactions(customer, period, existing)
@@ -75,27 +64,25 @@ class InvoiceService(
         customer: CustomerId,
         period: BillingPeriod,
     ): InvoiceSummary {
-        val currency = Currency.getInstance(invoice.currency)
-        val lines = invoiceLines.findByInvoiceIdOrderByOriginPeriodAscTransactionCodeAsc(invoice.id)
-            .map { line ->
-                SummaryLine(
-                    transactionCode = line.transactionCode,
-                    transactionCount = line.transactionCount,
-                    totalQuantity = line.totalQuantity,
-                    amount = Money(line.amount, currency),
-                    originPeriod = BillingPeriod.of(line.originPeriod),
-                    isAdjustment = line.isAdjustment,
-                )
-            }
+        val lines = invoices.findLines(invoice).map { line ->
+            SummaryLine(
+                transactionCode = line.transactionCode,
+                transactionCount = line.transactionCount,
+                totalQuantity = line.totalQuantity,
+                amount = line.amount,
+                originPeriod = line.originPeriod,
+                isAdjustment = line.isAdjustment,
+            )
+        }
 
         return InvoiceSummary(
             customerId = customer,
             period = period,
-            currency = currency,
+            currency = invoice.currency,
             lines = lines,
-            currentPeriodAmount = Money(invoice.currentPeriodAmount, currency),
-            adjustmentAmount = Money(invoice.adjustmentAmount, currency),
-            totalAmount = Money(invoice.totalAmount, currency),
+            currentPeriodAmount = invoice.currentPeriodAmount,
+            adjustmentAmount = invoice.adjustmentAmount,
+            totalAmount = invoice.totalAmount,
             transactionCount = invoice.transactionCount,
             status = InvoiceStatus.CLOSED,
         )
@@ -109,7 +96,7 @@ class InvoiceService(
         val tenant = TenantContext.current()
         val rated = charges.findChargesFor(tenant, customer, period)
 
-        val currency = rated.firstOrNull()?.let { Currency.getInstance(it.currency) } ?: defaultCurrency
+        val currency = rated.firstOrNull()?.amount?.currency ?: defaultCurrency
 
         return InvoiceSummary.from(
             customerId = customer,
@@ -121,11 +108,9 @@ class InvoiceService(
     }
 
     /**
-     * Groups rated transactions into summary lines.
-     *
-     * Amounts are **summed**, never recalculated from quantity and price: each was
-     * rounded once when its transaction was rated, and recalculating would round the
-     * aggregate differently, producing a total that no longer matches its own lines.
+     * Groups rated charges into summary lines. Amounts are summed, never recalculated from
+     * quantity and price: each was rounded once at rating time, and rounding the aggregate
+     * again would produce a total that no longer matches its own lines.
      */
     private fun aggregate(rated: List<Charge>, currency: Currency): List<SummaryLine> =
         rated.groupBy { it.transactionCode to it.originPeriod }
@@ -134,9 +119,11 @@ class InvoiceService(
                 SummaryLine(
                     transactionCode = code,
                     transactionCount = group.size.toLong(),
-                    totalQuantity = group.fold(BigDecimal.ZERO) { acc, r -> acc.add(r.quantity) },
-                    amount = Money.sum(group.map { Money(it.amount, currency) }, currency),
-                    originPeriod = BillingPeriod.of(originPeriod),
+                    totalQuantity = Quantity(
+                        group.fold(BigDecimal.ZERO) { acc, r -> acc.add(r.quantity.value) }
+                    ),
+                    amount = Money.sum(group.map { it.amount }, currency),
+                    originPeriod = originPeriod,
                     isAdjustment = group.first().isLateAdjustment,
                 )
             }
@@ -144,63 +131,53 @@ class InvoiceService(
     /**
      * Closes a period, freezing its totals.
      *
-     * ### Isolation
+     * `REPEATABLE_READ` rather than the default: under `READ_COMMITTED` a concurrently rated
+     * transaction could appear midway through the aggregation and the header would disagree
+     * with the lines. A serialisation error under contention means retry the close, never
+     * weaken the isolation.
      *
-     * `REPEATABLE_READ`, not the default `READ_COMMITTED`. Closing reads every rated
-     * transaction in the period and writes the aggregate; under `READ_COMMITTED` a
-     * transaction rated concurrently could appear midway through, so the header and the
-     * lines would disagree. `REPEATABLE_READ` gives one consistent snapshot. PostgreSQL
-     * may raise a serialisation error under contention, and the correct response is to
-     * retry the close — not to weaken the isolation.
-     *
-     * Closing twice is refused: the unique constraint on `(tenant, customer, period)`
-     * makes a duplicate impossible, and [Invoice.close] refuses to overwrite figures a
-     * customer may already have been billed from.
+     * Closing twice is refused, by the unique constraint on `(tenant, customer, period)` and
+     * by [Invoice.close], which will not overwrite figures a customer may have been billed from.
      */
     @Transactional(propagation = Propagation.REQUIRED, isolation = Isolation.REPEATABLE_READ)
-    fun closePeriod(customer: CustomerId, period: BillingPeriod): InvoiceSummary {
+    override fun closePeriod(customer: CustomerId, period: BillingPeriod): InvoiceSummary {
         val tenant = TenantContext.current()
 
-        invoices.findByTenantIdAndCustomerIdAndPeriodStart(
-            tenant.value, customer.value, period.startDate,
-        )?.let { existing ->
+        invoices.findInvoice(tenant, customer, period)?.let { existing ->
             check(!existing.isClosed) {
                 "Period $period for customer $customer is already closed"
             }
         }
 
         val rated = charges.findChargesFor(tenant, customer, period)
-        val currency = rated.firstOrNull()?.let { Currency.getInstance(it.currency) } ?: defaultCurrency
+        val currency = rated.firstOrNull()?.amount?.currency ?: defaultCurrency
         val lines = aggregate(rated, currency)
         val summary = InvoiceSummary.from(customer, period, currency, lines, InvoiceStatus.CLOSED)
 
-        val invoice = invoices.save(
+        val invoice = invoices.saveInvoice(
             Invoice(
-                tenantId = tenant.value,
-                customerId = customer.value,
-                periodStart = period.startDate,
-                periodEnd = period.endDate,
-                currency = currency.currencyCode,
-            ).apply {
-                close(
-                    currentPeriod = summary.currentPeriodAmount.amount,
-                    adjustments = summary.adjustmentAmount.amount,
-                    transactions = summary.transactionCount,
-                    now = clock.instant(),
-                )
-            }
+                tenantId = tenant,
+                customerId = customer,
+                period = period,
+                currency = currency,
+            ).close(
+                currentPeriod = summary.currentPeriodAmount,
+                adjustments = summary.adjustmentAmount,
+                transactions = summary.transactionCount,
+                now = clock.instant(),
+            )
         )
 
-        invoiceLines.saveAll(
+        invoices.saveLines(
             summary.lines.map { line ->
                 InvoiceLine(
-                    tenantId = tenant.value,
+                    tenantId = tenant,
                     invoiceId = invoice.id,
                     transactionCode = line.transactionCode,
                     transactionCount = line.transactionCount,
                     totalQuantity = line.totalQuantity,
-                    amount = line.amount.amount,
-                    originPeriod = line.originPeriod.startDate,
+                    amount = line.amount,
+                    originPeriod = line.originPeriod,
                     isAdjustment = line.isAdjustment,
                 )
             }

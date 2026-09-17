@@ -1,20 +1,21 @@
 package com.revenium.usage.ingestion.application
 
 import tools.jackson.databind.ObjectMapper
-import com.revenium.usage.ingestion.domain.EventConflict
-import com.revenium.usage.ingestion.domain.IngestionResult
-import com.revenium.usage.ingestion.domain.RawEvent
-import com.revenium.usage.ingestion.domain.RawTransactionInput
-import com.revenium.usage.ingestion.domain.RejectedEvent
-import com.revenium.usage.ingestion.domain.TransactionValidator
-import com.revenium.usage.ingestion.domain.UsageTransaction
-import com.revenium.usage.ingestion.domain.ValidationFailure
-import com.revenium.usage.ingestion.domain.ValidationOutcome
+import com.revenium.usage.ingestion.domain.model.EventConflict
+import com.revenium.usage.ingestion.domain.model.IngestionResult
+import com.revenium.usage.ingestion.domain.model.RawEvent
+import com.revenium.usage.ingestion.domain.model.RawTransactionInput
+import com.revenium.usage.ingestion.domain.model.RejectedEvent
+import com.revenium.usage.ingestion.domain.model.TransactionValidator
+import com.revenium.usage.ingestion.domain.model.UsageTransaction
+import com.revenium.usage.ingestion.domain.model.ValidationFailure
+import com.revenium.usage.ingestion.domain.model.ValidationOutcome
+import com.revenium.usage.ingestion.domain.port.`in`.IngestTransactionUseCase
+import com.revenium.usage.ingestion.domain.port.out.EventStore
+import com.revenium.usage.ingestion.domain.port.out.RatingQueue
+import com.revenium.usage.shared.domain.CustomerId
 import com.revenium.usage.shared.domain.EventId
-import com.revenium.usage.ingestion.infrastructure.EventConflictRepository
-import com.revenium.usage.ingestion.infrastructure.RawEventRepository
-import com.revenium.usage.ingestion.infrastructure.RejectedEventRepository
-import com.revenium.usage.ingestion.domain.RatingQueue
+import com.revenium.usage.shared.domain.TransactionCode
 import com.revenium.usage.tenancy.RequiresTenant
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
@@ -32,41 +33,18 @@ private val log = KotlinLogging.logger {}
 /**
  * Accepts usage transactions, records them durably, and queues them for rating.
  *
- * ### Transaction boundary
+ * Rating happens outside the ingestion transaction: the worker queries a committed table
+ * rather than an in-memory reference, so it cannot observe a row before it commits — the
+ * failure mode `@Async` inside a transactional method runs into.
  *
- * Ingestion is one short `REQUIRED` transaction at `READ_COMMITTED` covering exactly two
- * writes: the `raw_event` and its `outbox_message`. They commit together or not at all,
- * which is the guarantee that makes the outbox pattern work — there is no window where
- * an event is accepted but its rating work is lost.
+ * Duplicate detection is an INSERT that catches the unique violation, not SELECT-then-INSERT:
+ * concurrent delivery of the same event finds that race window and both callers believe
+ * they are first. The database arbitrates instead.
  *
- * Rating is deliberately **outside** this boundary. The request returns as soon as the
- * event is durable, and a worker picks the message up afterwards. Because the worker
- * queries a committed table rather than being handed an in-memory reference, it cannot
- * observe a row before its transaction commits — a failure mode that `@Async` inside a
- * transactional method runs into constantly.
- *
- * ### Idempotency
- *
- * Duplicate detection is an INSERT that catches the unique-constraint violation, not a
- * SELECT followed by an INSERT. A read-then-write has a race window that concurrent
- * delivery of the same event will find, and at that point both callers believe they are
- * first. The database arbitrates instead.
- *
- * ### Why the writes live in their own beans
- *
- * A constraint violation does two things that catching the exception does not undo:
- *
- * 1. It marks the surrounding transaction **rollback-only**. Catching the exception and
- *    carrying on leads to `UnexpectedRollbackException` at commit -- the work is lost
- *    anyway, just later and more confusingly.
- * 2. It leaves the Hibernate session unusable. The rejected entity stays in the
- *    persistence context with a null identifier and poisons the next flush.
- *
- * So the insert happens in [EventRecorder]'s own transaction. When it fails, that
- * transaction is already rolled back and gone, and [DuplicateResolver] runs on a clean
- * transaction and a clean session. `IngestionService` itself opens no transaction: it
- * decides which boundary to enter, and the outcome of a duplicate is a normal result
- * rather than a poisoned unit of work.
+ * The writes live in their own beans because a constraint violation marks the surrounding
+ * transaction rollback-only (yielding `UnexpectedRollbackException` at commit) and leaves
+ * the Hibernate session unusable. With the insert in [EventRecorder]'s own transaction,
+ * [DuplicateResolver] runs on a clean transaction and a clean session.
  */
 @Service
 @RequiresTenant
@@ -76,9 +54,9 @@ class IngestionService(
     private val duplicateResolver: DuplicateResolver,
     private val rejectionRecorder: RejectionRecorder,
     private val clock: Clock,
-) {
+) : IngestTransactionUseCase {
 
-    fun ingest(input: RawTransactionInput): IngestionResult {
+    override fun ingest(input: RawTransactionInput): IngestionResult {
         val tenant = TenantContext.current()
 
         return when (val outcome = validator.validate(input, tenant)) {
@@ -110,42 +88,36 @@ class IngestionService(
 }
 
 /**
- * Records an accepted event and queues its rating work, in one transaction.
+ * Records an accepted event and queues its rating work in one transaction, so there is no
+ * window in which an event is accepted but its rating work is lost.
  *
- * `REQUIRES_NEW` rather than `REQUIRED`: the caller must be able to survive a unique
- * violation here. With a joined transaction the violation would mark the caller's
- * transaction rollback-only, and the duplicate -- an expected, benign outcome -- would
- * fail the whole request at commit time.
- *
- * The two writes share this boundary deliberately. Committing them together is the
- * guarantee the outbox pattern rests on: there is no window in which an event is
- * accepted but its rating work is lost.
+ * `REQUIRES_NEW`, because a joined transaction would let a unique violation here — an
+ * expected, benign duplicate — mark the caller rollback-only and fail the whole request.
  */
 @Service
 class EventRecorder(
-    private val rawEvents: RawEventRepository,
+    private val events: EventStore,
     private val ratingQueue: RatingQueue,
     private val clock: Clock,
 ) {
 
     @Transactional(propagation = Propagation.REQUIRES_NEW, isolation = Isolation.READ_COMMITTED)
     fun record(tenant: TenantId, transaction: UsageTransaction): IngestionResult {
-        val entity = RawEvent(
-            tenantId = tenant.value,
-            eventId = transaction.eventId.value,
-            customerId = transaction.customerId.value,
-            transactionCode = transaction.transactionCode.value,
+        val event = RawEvent(
+            tenantId = tenant,
+            eventId = transaction.eventId,
+            customerId = transaction.customerId,
+            transactionCode = transaction.transactionCode,
             occurredAt = transaction.occurredAt,
-            quantity = transaction.quantity.value,
+            quantity = transaction.quantity,
             payload = transaction.rawPayload,
             payloadHash = transaction.payloadHash,
             receivedAt = clock.instant(),
         )
 
-        // saveAndFlush, not save: the constraint violation must surface here, inside
-        // this transaction, rather than at commit time where the caller could no longer
-        // distinguish a duplicate from a genuine failure.
-        val saved = rawEvents.saveAndFlush(entity)
+        // The store flushes, so a duplicate surfaces here rather than at commit time,
+        // where the caller could no longer distinguish one from a genuine failure.
+        val saved = events.record(event)
         ratingQueue.enqueue(tenant, saved.id)
 
         log.debug { "Accepted event ${transaction.eventId} for tenant $tenant" }
@@ -156,33 +128,27 @@ class EventRecorder(
 /**
  * Resolves a duplicate in its own transaction and its own Hibernate session.
  *
- * A separate bean because `REQUIRES_NEW` is proxy-based, and because the caller's
- * session is unusable once a constraint violation has occurred: the rejected entity
- * remains in the persistence context with a null identifier, and the next flush fails
- * with `AssertionFailure` rather than doing anything useful.
- *
- * `REQUIRES_NEW` also means the conflict record survives even if the outer transaction
- * is later rolled back -- the discrepancy happened, and the evidence of it should not
- * disappear with the attempt that found it.
+ * A separate bean because `REQUIRES_NEW` is proxy-based, and because a constraint violation
+ * leaves the caller's session unusable: the rejected entity stays in the persistence context
+ * with a null identifier and the next flush fails with `AssertionFailure`. The independent
+ * transaction also keeps the conflict record if the outer attempt is rolled back.
  */
 @Service
 class DuplicateResolver(
-    private val rawEvents: RawEventRepository,
-    private val conflicts: EventConflictRepository,
+    private val events: EventStore,
     private val clock: Clock,
 ) {
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     fun resolve(tenant: TenantId, transaction: UsageTransaction): IngestionResult {
-        val existing = rawEvents.findByTenantIdAndEventId(tenant.value, transaction.eventId.value)
+        val existing = events.findByEventId(tenant, transaction.eventId)
             ?: throw IllegalStateException(
                 "Unique violation for event ${transaction.eventId} but no existing row found"
             )
 
         // Counted even when the bodies match: an identical re-delivery writes nothing
         // else, so without this tally it would be invisible to reconciliation.
-        existing.recordDuplicateDelivery(clock.instant())
-        rawEvents.save(existing)
+        events.recordDuplicateDelivery(existing.recordDuplicateDelivery(clock.instant()))
 
         val payloadDiffers = existing.payloadHash != transaction.payloadHash
         if (payloadDiffers) {
@@ -192,9 +158,9 @@ class DuplicateResolver(
                 "Event ${transaction.eventId} re-delivered with a different payload " +
                     "for tenant $tenant; keeping the original"
             }
-            conflicts.save(
+            events.recordConflict(
                 EventConflict(
-                    tenantId = tenant.value,
+                    tenantId = tenant,
                     rawEventId = existing.id,
                     originalPayloadHash = existing.payloadHash,
                     conflictingPayloadHash = transaction.payloadHash,
@@ -214,19 +180,15 @@ class DuplicateResolver(
 }
 
 /**
- * Records rejections in their own transaction.
+ * Records rejections in their own transaction, so the evidence survives a rollback of the
+ * ingestion attempt it is evidence of.
  *
- * A separate bean because `REQUIRES_NEW` is proxy-based: calling a `REQUIRES_NEW` method
- * on `this` would not start a new transaction at all, and the record would quietly join
- * the caller's — the exact bug this class exists to avoid.
- *
- * The independent transaction is what lets the evidence survive a rollback of the
- * ingestion attempt. Otherwise the record of a rejection would roll back together with
- * the thing it is evidence of, and reconciliation could not account for what arrived.
+ * A separate bean because `REQUIRES_NEW` is proxy-based: self-invocation would quietly join
+ * the caller's transaction instead.
  */
 @Service
 class RejectionRecorder(
-    private val rejectedEvents: RejectedEventRepository,
+    private val events: EventStore,
     private val objectMapper: ObjectMapper,
     private val clock: Clock,
 ) {
@@ -238,12 +200,14 @@ class RejectionRecorder(
         failures: List<ValidationFailure>,
         eventId: EventId?,
     ) {
-        rejectedEvents.save(
+        events.recordRejection(
             RejectedEvent(
-                tenantId = tenant.value,
-                eventId = eventId?.value,
-                customerId = input.customerId?.take(200),
-                transactionCode = input.transactionCode?.take(100),
+                tenantId = tenant,
+                eventId = eventId,
+                customerId = input.customerId?.trim()?.take(CustomerId.MAX_LENGTH)
+                    ?.takeIf { it.isNotBlank() }?.let(::CustomerId),
+                transactionCode = input.transactionCode?.trim()?.take(TransactionCode.MAX_LENGTH)
+                    ?.takeIf { it.isNotBlank() }?.let(::TransactionCode),
                 occurredAt = runCatching { input.occurredAt?.let(Instant::parse) }.getOrNull(),
                 rejectionReasons = objectMapper.writeValueAsString(
                     failures.map { mapOf("field" to it.field, "reason" to it.reason) }

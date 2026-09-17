@@ -4,6 +4,7 @@ import com.revenium.usage.reconciliation.domain.EventState
 import com.revenium.usage.reconciliation.domain.ReconciliationLine
 import com.revenium.usage.reconciliation.domain.ReconciliationReport
 import com.revenium.usage.reconciliation.domain.StateCount
+import com.revenium.usage.reconciliation.domain.port.`in`.ReconcileUseCase
 import com.revenium.usage.shared.domain.BillingPeriod
 import com.revenium.usage.shared.domain.CustomerId
 import com.revenium.usage.shared.domain.Money
@@ -21,15 +22,10 @@ import java.util.Currency
  * Produces reconciliation evidence: where every received event ended up, and how any
  * billed total traces back to the events and pricing rules behind it.
  *
- * ### Why JDBC rather than JPA
- *
- * These are aggregate queries over several tables producing projections, not entity
- * graphs. Expressing them through JPA would add a mapping layer over data that is never
- * mutated, and would obscure the very arithmetic the report exists to make checkable.
- *
- * Every query still filters by tenant explicitly, even though row-level security would
- * do it anyway: the application states its intent and the database enforces it
- * independently.
+ * JDBC rather than JPA: these are aggregate projections over never-mutated data, and a mapping
+ * layer would obscure the arithmetic the report exists to make checkable. Every query still
+ * filters by tenant explicitly even though row-level security would do it anyway — the
+ * application states its intent and the database enforces it independently.
  */
 @Service
 @RequiresTenant
@@ -37,30 +33,20 @@ class ReconciliationService(
     private val jdbc: JdbcTemplate,
     private val defaultCurrency: Currency,
     private val clock: Clock,
-) {
+) : ReconcileUseCase {
 
     /**
      * Counts of every state for a customer and period, plus the amount billed.
      *
-     * ### Why this reports by ORIGIN period
-     *
-     * The report answers "does what we received in this period account for what we
-     * billed for it?", so both sides must be measured the same way. Events are counted
-     * by `occurred_at`; rated transactions are therefore counted by `origin_period`,
-     * which is the same instant expressed as a period — not by `billing_period`.
-     *
-     * Using `billing_period` was a real defect. A late adjustment occurs in one period
-     * and is charged in another, so it counted on the received side of its origin period
-     * and on the billed side of a later one. Neither period's arithmetic could ever
-     * balance, and the report said so — correctly, but about its own query rather than
-     * about the data.
-     *
-     * The invoice summary is the place `billing_period` belongs: it answers a different
-     * question, namely what a customer owes this period, and it reports adjustments
-     * separately precisely because the two differ.
+     * Reports by `origin_period`, not `billing_period`: the question is whether what we
+     * received in a period accounts for what we billed for it, so both sides must be measured
+     * by `occurred_at`. Using `billing_period` was a real defect — a late adjustment counted
+     * on the received side of its origin period and the billed side of a later one, so
+     * neither period could ever balance. `billing_period` belongs to the invoice summary,
+     * which answers the different question of what a customer owes this period.
      */
     @Transactional(readOnly = true)
-    fun report(customer: CustomerId, period: BillingPeriod): ReconciliationReport {
+    override fun report(customer: CustomerId, period: BillingPeriod): ReconciliationReport {
         val tenant = TenantContext.current().value
         val from = Timestamp.from(period.start)
         val to = Timestamp.from(period.end)
@@ -81,10 +67,8 @@ class ReconciliationService(
             Long::class.java, tenant, customer.value, from, to,
         ) ?: 0
 
-        // A duplicate creates no raw_event row of its own -- that is exactly what the
-        // unique constraint is for -- so it is counted from the tally kept on the event
-        // it duplicated. Summing the counter rather than counting rows means a retry
-        // storm is reported accurately instead of as a single duplicate.
+        // A duplicate creates no raw_event row of its own, so it is counted from the tally on
+        // the event it duplicated: summing reports a retry storm accurately, not as one duplicate.
         val duplicates = jdbc.queryForObject(
             """
             SELECT coalesce(sum(duplicate_delivery_count), 0) FROM raw_event
@@ -105,8 +89,7 @@ class ReconciliationService(
             tenant, customer.value, from, to,
         ).toMap()
 
-        // Rated rows split by whether their period has been closed: RATED while open,
-        // INVOICED once the invoice is frozen.
+        // RATED while the period is open, INVOICED once the invoice is frozen.
         val ratedRows = jdbc.query(
             """
             SELECT coalesce(i.status, 'OPEN') AS invoice_status,
@@ -114,8 +97,8 @@ class ReconciliationService(
                    coalesce(sum(r.amount), 0) AS total,
                    min(r.currency) AS currency
             FROM rated_transaction r
-            -- Joined on billing_period: whether a charge is INVOICED depends on the
-            -- invoice it actually landed in, even while it is counted under its origin.
+            -- Joined on billing_period: whether a charge is INVOICED depends on the invoice
+            -- it landed in, even while it is counted under its origin.
             LEFT JOIN invoice i
                    ON i.tenant_id = r.tenant_id
                   AND i.customer_id = r.customer_id
@@ -167,8 +150,7 @@ class ReconciliationService(
         return ReconciliationReport(
             customerId = customer,
             period = period,
-            // Received counts everything that arrived, including deliveries that were
-            // rejected or turned out to be duplicates.
+            // Everything that arrived, rejections and duplicate deliveries included.
             receivedCount = received + rejected + duplicates,
             states = states,
             billedAmount = billed,
@@ -179,20 +161,15 @@ class ReconciliationService(
     /**
      * Every rated transaction behind a period's total, traced to its event and rule.
      *
-     * This is the second step of the trace: a summary line says a code is worth X across
-     * N transactions, and this lists those N rows with the numbers that produced X.
-     *
      * Matched on `billing_period`, unlike [report]: this traces an invoice figure, and an
      * invoice contains exactly what was charged in its period, adjustments included.
      */
     @Transactional(readOnly = true)
-    fun lines(
+    override fun lines(
         customer: CustomerId,
         period: BillingPeriod,
-        // No default value: this bean is proxied for both @RequiresTenant and
-        // @Transactional, and a default on a proxied method makes Kotlin emit a
-        // synthetic DefaultConstructorMarker parameter that Spring tries to autowire.
-        // The only caller passes it explicitly anyway.
+        // No default value: on a proxied method Kotlin emits a synthetic
+        // DefaultConstructorMarker parameter that Spring then tries to autowire.
         transactionCode: String?,
     ): List<ReconciliationLine> {
         val tenant = TenantContext.current().value

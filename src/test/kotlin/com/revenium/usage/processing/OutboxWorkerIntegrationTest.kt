@@ -1,12 +1,12 @@
 package com.revenium.usage.processing
 
 import com.revenium.usage.ingestion.application.IngestionService
-import com.revenium.usage.ingestion.domain.IngestionResult
-import com.revenium.usage.ingestion.domain.RawTransactionInput
+import com.revenium.usage.ingestion.domain.model.IngestionResult
+import com.revenium.usage.ingestion.domain.model.RawTransactionInput
 import com.revenium.usage.processing.application.OutboxWorker
-import com.revenium.usage.processing.domain.OutboxStatus
-import com.revenium.usage.processing.infrastructure.OutboxMessageRepository
-import com.revenium.usage.rating.infrastructure.RatedTransactionRepository
+import com.revenium.usage.processing.domain.model.OutboxStatus
+import com.revenium.usage.processing.infrastructure.persistence.OutboxMessageJpaRepository
+import com.revenium.usage.rating.infrastructure.persistence.RatedTransactionJpaRepository
 import com.revenium.usage.support.IntegrationTest
 import com.revenium.usage.support.PostgresContainerInitializer
 import com.revenium.usage.tenancy.TenantContext
@@ -34,8 +34,8 @@ import kotlin.test.assertTrue
 class OutboxWorkerIntegrationTest(
     @Autowired val ingestionService: IngestionService,
     @Autowired val worker: OutboxWorker,
-    @Autowired val outbox: OutboxMessageRepository,
-    @Autowired val ratedTransactions: RatedTransactionRepository,
+    @Autowired val outbox: OutboxMessageJpaRepository,
+    @Autowired val ratedTransactions: RatedTransactionJpaRepository,
     @Autowired val jdbc: JdbcTemplate,
 ) {
 

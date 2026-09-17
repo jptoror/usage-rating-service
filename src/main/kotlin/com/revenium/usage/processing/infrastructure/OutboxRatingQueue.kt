@@ -1,7 +1,8 @@
 package com.revenium.usage.processing.infrastructure
 
-import com.revenium.usage.ingestion.domain.RatingQueue
-import com.revenium.usage.processing.domain.OutboxMessage
+import com.revenium.usage.ingestion.domain.port.out.RatingQueue
+import com.revenium.usage.processing.domain.model.OutboxMessage
+import com.revenium.usage.processing.domain.port.out.OutboxMessageStore
 import com.revenium.usage.tenancy.TenantId
 import org.springframework.stereotype.Repository
 
@@ -13,9 +14,9 @@ import org.springframework.stereotype.Repository
  * reintroduce the window the outbox pattern exists to close.
  */
 @Repository
-class OutboxRatingQueue(private val messages: OutboxMessageRepository) : RatingQueue {
+class OutboxRatingQueue(private val messages: OutboxMessageStore) : RatingQueue {
 
     override fun enqueue(tenant: TenantId, rawEventId: Long) {
-        messages.save(OutboxMessage(tenantId = tenant.value, rawEventId = rawEventId))
+        messages.enqueue(OutboxMessage(tenantId = tenant, rawEventId = rawEventId))
     }
 }

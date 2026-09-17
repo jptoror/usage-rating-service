@@ -20,36 +20,17 @@ data class ClaimedWork(
 )
 
 /**
- * Claims outbox work for a worker, using `FOR UPDATE SKIP LOCKED`.
+ * Claims outbox work with `FOR UPDATE SKIP LOCKED`, so N instances polling simultaneously
+ * take disjoint batches with no coordination, leader election or broker.
  *
- * ### Why raw JDBC rather than JPA
+ * Raw JDBC rather than JPA because `SKIP LOCKED` is the whole mechanism and JPA's pessimistic
+ * locking does not express it portably; this is also a projection over a join, not an entity.
  *
- * `SKIP LOCKED` is the entire mechanism here and JPA's pessimistic locking does not
- * express it portably. This is also a join across two tables returning a projection, not
- * an entity graph, so mapping it through Hibernate would add overhead and obscure the
- * one line that matters.
- *
- * ### How the claim works
- *
- * `FOR UPDATE` locks the selected rows for the duration of the transaction. `SKIP LOCKED`
- * makes a second worker step over rows another worker already holds instead of blocking
- * on them, so N instances polling simultaneously take **disjoint** batches with no
- * coordination, no leader election, and no external broker.
- *
- * The `UPDATE ... WHERE id = ANY(...)` in the same transaction marks the claim durably,
- * so a worker that dies after committing does not hand the same rows to someone else.
- *
- * ### The guarantee, and its limit
- *
- * Delivery is **at-least-once**, never exactly-once. A worker that dies mid-transaction
- * releases its locks and the rows become claimable again, which is the desired behaviour
- * — but it means the same event can be rated twice. That is safe only because
- * `rated_transaction` carries a partial unique index; the idempotency is in the database,
- * not in this query.
- *
- * Ordering is not preserved across workers. Acceptable here: rating one event never
- * depends on another. If per-customer ordering were ever required, the claim would
- * partition by `customer_id` and lock per partition.
+ * Delivery is at-least-once, never exactly-once: a worker that dies mid-transaction releases
+ * its locks and the rows become claimable again, so the same event can be rated twice. That
+ * is safe only because of the partial unique index on `rated_transaction` — the idempotency
+ * is in the database, not in this query. Ordering is not preserved across workers, which is
+ * fine because rating one event never depends on another.
  */
 @Repository
 class OutboxClaimRepository(private val jdbc: JdbcTemplate) {
@@ -57,14 +38,12 @@ class OutboxClaimRepository(private val jdbc: JdbcTemplate) {
     /**
      * Claims up to [batchSize] messages and marks them `PROCESSING`.
      *
-     * `REQUIRES_NEW` so the claim commits on its own. Each message is then processed in
-     * its own transaction: one poison message must not roll back the claim for the whole
-     * batch, or a single bad row would stall every good one behind it.
+     * `REQUIRES_NEW` so the claim commits on its own: one poison message must not roll back
+     * the claim for the whole batch and stall every good row behind it.
      *
-     * [instanceId] is recorded on each claimed row as evidence of which instance took
-     * which work. It has no default: a default value on a method of a Spring-proxied
-     * bean makes Kotlin emit a synthetic `DefaultConstructorMarker` parameter that
-     * Spring tries to autowire, and the application fails to start.
+     * [instanceId] has no default value: a default on a method of a Spring-proxied bean makes
+     * Kotlin emit a synthetic `DefaultConstructorMarker` parameter that Spring tries to
+     * autowire, and the application fails to start.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     fun claimBatch(now: Instant, batchSize: Int, instanceId: String): List<ClaimedWork> {
@@ -99,15 +78,11 @@ class OutboxClaimRepository(private val jdbc: JdbcTemplate) {
     }
 
     /**
-     * Returns messages stuck in `PROCESSING` to the queue.
+     * Returns messages stuck in `PROCESSING` to the queue. A worker killed mid-flight leaves
+     * rows there for ever otherwise, since the claim query only looks at `PENDING`/`UNRATED`.
      *
-     * A worker killed between claiming and finishing leaves its rows marked
-     * `PROCESSING` with nothing working on them. Without this they would sit there for
-     * ever: the claim query only looks at `PENDING` and `UNRATED`.
-     *
-     * The timeout must exceed the longest plausible processing time, or this will
-     * reclaim work that is still legitimately running — harmless thanks to the unique
-     * index, but wasteful.
+     * The timeout must exceed the longest plausible processing time, or this reclaims work
+     * still legitimately running — harmless thanks to the unique index, but wasteful.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     fun reclaimStale(now: Instant, timeout: java.time.Duration): Int =
@@ -115,11 +90,8 @@ class OutboxClaimRepository(private val jdbc: JdbcTemplate) {
 
     private companion object {
         /**
-         * Joins the event onto its queue row so the worker has everything it needs
-         * without a second round trip per message.
-         *
-         * `ORDER BY o.id` approximates arrival order within a single worker; across
-         * workers, ordering is explicitly not guaranteed.
+         * Joins the event onto its queue row so the worker needs no second round trip per
+         * message. `ORDER BY o.id` approximates arrival order within a single worker only.
          */
         const val CLAIM_SQL = """
             SELECT o.id, o.tenant_id, o.raw_event_id, o.attempt_count,

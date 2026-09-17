@@ -2,12 +2,14 @@ package com.revenium.usage.invoicing.api
 
 import com.ninjasquad.springmockk.MockkBean
 import com.revenium.usage.invoicing.application.InvoiceService
-import com.revenium.usage.invoicing.domain.InvoiceStatus
-import com.revenium.usage.invoicing.domain.InvoiceSummary
-import com.revenium.usage.invoicing.domain.SummaryLine
+import com.revenium.usage.invoicing.domain.model.InvoiceStatus
+import com.revenium.usage.invoicing.domain.model.InvoiceSummary
+import com.revenium.usage.invoicing.domain.model.SummaryLine
 import com.revenium.usage.shared.domain.BillingPeriod
 import com.revenium.usage.shared.domain.CustomerId
 import com.revenium.usage.shared.domain.Money
+import com.revenium.usage.shared.domain.Quantity
+import com.revenium.usage.shared.domain.TransactionCode
 import io.mockk.every
 import io.mockk.slot
 import org.junit.jupiter.api.Test
@@ -37,8 +39,8 @@ class InvoiceControllerTest(@Autowired val mvc: MockMvc) {
         period = september,
         currency = usd,
         lines = listOf(
-            SummaryLine("VEHICLE_REGISTRATION", 620, BigDecimal("1240"), Money.of(BigDecimal("1240"), usd), september, false),
-            SummaryLine("VEHICLE_REGISTRATION", 3, BigDecimal("15"), Money.of(BigDecimal("37.5"), usd), august, true),
+            SummaryLine(TransactionCode("VEHICLE_REGISTRATION"), 620, Quantity(BigDecimal("1240")), Money.of(BigDecimal("1240"), usd), september, false),
+            SummaryLine(TransactionCode("VEHICLE_REGISTRATION"), 3, Quantity(BigDecimal("15")), Money.of(BigDecimal("37.5"), usd), august, true),
         ),
         status = status,
     )

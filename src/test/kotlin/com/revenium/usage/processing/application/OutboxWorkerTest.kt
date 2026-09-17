@@ -1,14 +1,16 @@
 package com.revenium.usage.processing.application
 
-import com.revenium.usage.pricing.domain.PricingRule
-import com.revenium.usage.processing.domain.InstanceId
+import com.revenium.usage.pricing.domain.model.PricingRule
+import com.revenium.usage.processing.domain.model.InstanceId
 import com.revenium.usage.processing.infrastructure.ClaimedWork
 import com.revenium.usage.processing.infrastructure.OutboxClaimRepository
 import com.revenium.usage.rating.application.ConcurrentRatingException
 import com.revenium.usage.rating.application.RatingService
-import com.revenium.usage.rating.domain.RatingOutcome
+import com.revenium.usage.rating.domain.model.RatingOutcome
 import com.revenium.usage.shared.domain.BillingPeriod
 import com.revenium.usage.shared.domain.Money
+import com.revenium.usage.shared.domain.UnitPrice
+import com.revenium.usage.shared.domain.TransactionCode
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
 import io.mockk.every
@@ -60,10 +62,10 @@ class OutboxWorkerTest {
 
     private fun ratedOutcome() = RatingOutcome.Rated(
         rule = PricingRule(
-            tenantId = "tenant-a",
-            transactionCode = "VEHICLE_REGISTRATION",
-            unitPrice = BigDecimal("2.000000"),
-            currency = "USD",
+            tenantId = TenantId("tenant-a"),
+            transactionCode = TransactionCode("VEHICLE_REGISTRATION"),
+            unitPrice = UnitPrice(BigDecimal("2.000000")),
+            currency = Currency.getInstance("USD"),
             effectiveFrom = Instant.parse("2026-01-01T00:00:00Z"),
             id = 1L,
         ),

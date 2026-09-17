@@ -1,8 +1,10 @@
 package com.revenium.usage.pricing.api
 
 import com.ninjasquad.springmockk.MockkBean
-import com.revenium.usage.pricing.domain.PricingRule
-import com.revenium.usage.pricing.infrastructure.PricingRuleJpaRepository
+import com.revenium.usage.pricing.domain.model.PricingRule
+import com.revenium.usage.pricing.domain.port.out.PricingRuleLookup
+import com.revenium.usage.shared.domain.TransactionCode
+import com.revenium.usage.shared.domain.UnitPrice
 import com.revenium.usage.tenancy.TenantContext
 import com.revenium.usage.tenancy.TenantId
 import io.mockk.every
@@ -17,13 +19,13 @@ import org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPat
 import org.springframework.test.web.servlet.result.MockMvcResultMatchers.status
 import java.math.BigDecimal
 import java.time.Instant
-import java.util.Optional
+import java.util.Currency
 
 @WebMvcTest(PricingRuleController::class)
 class PricingRuleControllerTest(@Autowired val mvc: MockMvc) {
 
     @MockkBean
-    private lateinit var repository: PricingRuleJpaRepository
+    private lateinit var pricingRules: PricingRuleLookup
 
     @BeforeEach
     fun enterTenantScope() {
@@ -36,10 +38,10 @@ class PricingRuleControllerTest(@Autowired val mvc: MockMvc) {
     fun cleanUp() = TenantContext.clear()
 
     private fun rule(tenantId: String = "tenant-a", id: Long = 7L) = PricingRule(
-        tenantId = tenantId,
-        transactionCode = "VEHICLE_REGISTRATION",
-        unitPrice = BigDecimal("2.500000"),
-        currency = "USD",
+        tenantId = TenantId(tenantId),
+        transactionCode = TransactionCode("VEHICLE_REGISTRATION"),
+        unitPrice = UnitPrice(BigDecimal("2.500000")),
+        currency = Currency.getInstance("USD"),
         effectiveFrom = Instant.parse("2026-07-01T00:00:00Z"),
         effectiveTo = null,
         description = "Rate increase from H2 2026",
@@ -48,7 +50,7 @@ class PricingRuleControllerTest(@Autowired val mvc: MockMvc) {
 
     @Test
     fun `lists the tenant's rules`() {
-        every { repository.findByTenantIdOrderByTransactionCodeAscEffectiveFromAsc("tenant-a") } returns listOf(rule())
+        every { pricingRules.findAllFor(TenantId("tenant-a")) } returns listOf(rule())
 
         mvc.perform(get("/api/v1/pricing-rules").header("X-Tenant-Id", "tenant-a"))
             .andExpect(status().isOk)
@@ -61,7 +63,7 @@ class PricingRuleControllerTest(@Autowired val mvc: MockMvc) {
     fun `fetches one rule so an amount can be verified independently`() {
         // The last step of tracing a charge: quantity x this unitPrice must equal the
         // amount on the reconciliation line.
-        every { repository.findById(7L) } returns Optional.of(rule())
+        every { pricingRules.findById(TenantId("tenant-a"), 7L) } returns rule()
 
         mvc.perform(get("/api/v1/pricing-rules/7").header("X-Tenant-Id", "tenant-a"))
             .andExpect(status().isOk)
@@ -71,9 +73,9 @@ class PricingRuleControllerTest(@Autowired val mvc: MockMvc) {
 
     @Test
     fun `returns 404 for a rule belonging to another tenant`() {
-        // A 404 rather than a leak: the tenant is checked here as well as by RLS, so
-        // the response is identical whether the rule is absent or simply not theirs.
-        every { repository.findById(7L) } returns Optional.of(rule(tenantId = "tenant-b"))
+        // A 404 rather than a leak: the lookup scopes by tenant as well as id, so the
+        // response is identical whether the rule is absent or simply not theirs.
+        every { pricingRules.findById(TenantId("tenant-a"), 7L) } returns null
 
         mvc.perform(get("/api/v1/pricing-rules/7").header("X-Tenant-Id", "tenant-a"))
             .andExpect(status().isNotFound)
@@ -81,7 +83,7 @@ class PricingRuleControllerTest(@Autowired val mvc: MockMvc) {
 
     @Test
     fun `returns 404 for a rule that does not exist`() {
-        every { repository.findById(99L) } returns Optional.empty()
+        every { pricingRules.findById(TenantId("tenant-a"), 99L) } returns null
 
         mvc.perform(get("/api/v1/pricing-rules/99").header("X-Tenant-Id", "tenant-a"))
             .andExpect(status().isNotFound)

@@ -54,8 +54,7 @@ class GlobalExceptionHandler {
 
     @ExceptionHandler(CrossTenantAccessException::class)
     fun handleCrossTenant(e: CrossTenantAccessException): ProblemDetail {
-        // Logged in full, reported vaguely: confirming which tenant identifiers exist
-        // is itself a small information leak.
+        // Logged in full, reported vaguely: confirming which tenant ids exist is a leak.
         log.warn { "Cross-tenant access rejected: $e" }
         return problem(
             status = HttpStatus.FORBIDDEN,
@@ -75,13 +74,9 @@ class GlobalExceptionHandler {
         )
 
     /**
-     * A malformed path or query parameter.
-     *
-     * Reached when `period=not-a-period` fails to parse, or a value fails a domain
-     * type's `require` -- both of which are the caller sending something wrong, not the
-     * service failing. Without this they fell through to the catch-all and were reported
-     * as 500, which tells an integrator to retry and an operator to investigate, when
-     * neither is the right response.
+     * A malformed path or query parameter, or a value failing a domain type's `require`.
+     * Without this they fell through to the catch-all and were reported as 500, telling an
+     * integrator to retry and an operator to investigate when neither is right.
      */
     @ExceptionHandler(
         DateTimeParseException::class,
@@ -95,18 +90,14 @@ class GlobalExceptionHandler {
             status = HttpStatus.BAD_REQUEST,
             type = "malformed-parameter",
             title = "Malformed parameter",
-            // The exception's own message names the offending value without revealing
-            // anything internal: "Text 'not-a-period' could not be parsed".
+            // The exception's message names the offending value and nothing internal.
             detail = e.message ?: "A request parameter could not be parsed",
         )
     }
 
     /**
-     * A domain rule that the caller's input could not satisfy.
-     *
-     * `IllegalStateException` covers cases like closing an already-closed period:
-     * a legitimate request that conflicts with the current state, which is 409 rather
-     * than 400 or 500.
+     * `IllegalStateException` covers cases like closing an already-closed period: a legitimate
+     * request conflicting with the current state, so 409 rather than 400 or 500.
      */
     @ExceptionHandler(IllegalStateException::class)
     fun handleConflict(e: IllegalStateException): ProblemDetail {
