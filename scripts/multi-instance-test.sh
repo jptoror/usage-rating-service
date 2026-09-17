@@ -58,6 +58,25 @@ if [ "$INSTANCES" -lt 2 ]; then
     exit 1
 fi
 
+# wait_for_health asks the load balancer, which reports UP as soon as ONE instance is
+# behind it. Starting here would test a single worker racing itself: it drains the queue
+# while the others are still booting, and the distribution assertion fails for a reason
+# that has nothing to do with SKIP LOCKED. CI failed exactly this way.
+wait_for_all_instances() {
+    local attempts="${1:-60}" total ready
+    total=$(docker compose ps -q app | wc -l | tr -d ' ')
+    for _ in $(seq 1 "$attempts"); do
+        ready=$(docker compose ps -q app \
+            | xargs -I{} docker inspect --format '{{.State.Health.Status}}' {} 2>/dev/null \
+            | grep -c healthy || true)
+        [ "$ready" -ge "$total" ] && { info "all $total instances are healthy"; return 0; }
+        sleep 2
+    done
+    printf '%sOnly %s of %s instances became healthy%s\n' "$RED" "$ready" "$total" "$RESET" >&2
+    return 1
+}
+wait_for_all_instances
+
 # Read from the running container rather than assuming the default: an environment
 # variable overrides application.yml, so the value in the source tree can differ from
 # the one actually in force. A load measurement was once misread for exactly that reason.

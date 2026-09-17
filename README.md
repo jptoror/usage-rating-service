@@ -523,6 +523,7 @@ Simplified, as the brief permits:
   volume discounts — the model leaves room for them without a destructive migration.
   Pricing is read-only over the API; price changes are an administrative operation.
 - **Currency.** One currency per pricing rule, no FX conversion.
+
 Not sacrificed: no double billing, every amount explainable, no cross-tenant access,
 append-only history, decimal arithmetic with explicit rounding.
 
@@ -541,15 +542,40 @@ conflict whose two payload hashes are equal. Every
 mapper is covered by a round-trip test: one that silently drops a field would otherwise
 surface only in an audit, with the amount written under the wrong period.
 
+### Decisions a reviewer might have made differently
+
+These are settled, not open. Each is implemented, tested and argued; they are listed
+because the alternative is defensible and the reasoning is worth stating rather than
+leaving to be inferred.
+
+- **A duplicate returns `200`, not `409`.** Re-delivery is the upstream retry working as
+  intended, and a 4xx tells an integrator to back off or alert over something that
+  behaved correctly. The `status` field distinguishes the cases and reconciliation counts
+  every re-delivery. A reviewer who treats "this event id already exists" as a client
+  error would choose `409`; that is a one-line change and the tests state the current
+  contract explicitly.
+- **Period close is an administrative endpoint, not a scheduler.** A scheduled close is
+  more realistic in production. An endpoint is demonstrable in a review, and it makes the
+  close a deliberate act in the evidence transcripts rather than something that happens
+  while nobody is looking. The scheduler would wrap this same endpoint.
+
 ### Open questions
 
-- **`200` vs `409` for duplicates** — argued above, but a reviewer may reasonably prefer
-  `409`. It is a one-line change.
-- **Period close** is manual. A scheduled close is more realistic; an endpoint is more
-  demonstrable.
-- **Multi-currency customers.** A customer whose transaction codes are priced in different
-  currencies would need per-currency invoice lines. Out of scope, and the schema would need
-  a change to support it honestly.
+One genuine ambiguity, which the brief does not settle and which I did not want to
+resolve by silently picking an answer:
+
+- **A customer with transaction codes priced in different currencies.** Today one
+  currency per pricing rule, and an invoice carries a single currency — so such a
+  customer's invoice would be wrong rather than merely limited. Handling it honestly
+  means per-currency invoice lines and totals, which is a schema change, and it raises a
+  policy question this exercise cannot answer alone: whether that customer receives one
+  invoice per currency or one invoice with several currency sections.
+
+  The failure mode today is loud rather than silent: `Money.plus` rejects operands of
+  different currencies, so summarising such a customer throws instead of producing a
+  total that adds euros to dollars. That is the right behaviour for an unanswered
+  question — it refuses rather than guesses — but it is a refusal, not support, and the
+  modelling decision belongs to whoever owns the billing policy.
 
 ---
 
