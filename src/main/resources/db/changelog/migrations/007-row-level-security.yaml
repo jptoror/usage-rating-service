@@ -1,0 +1,79 @@
+databaseChangeLog:
+
+  # ---------------------------------------------------------------------------
+  # Row-level security -- the backstop for tenant isolation.
+  #
+  # The application connects as a role with no BYPASSRLS that does NOT own these
+  # tables (a table owner bypasses RLS by default in Postgres, so an owner
+  # connection would silently defeat all of this). Each transaction sets
+  # `app.tenant_id` with SET LOCAL, and every policy below filters on it.
+  #
+  # The consequence that matters: a SELECT that forgets its tenant filter returns
+  # zero rows from other tenants instead of leaking them. Application checks are
+  # the first line of defence; this is the one that holds when they fail.
+  #
+  # current_setting(..., true) returns NULL when unset rather than erroring, and
+  # `tenant_id = NULL` is NULL, so an unset context sees nothing. Failing closed
+  # is the correct default here.
+  # ---------------------------------------------------------------------------
+  - changeSet:
+      id: 007-01-enable-rls
+      author: jptoro
+      changes:
+        - sql:
+            splitStatements: false
+            sql: |
+              DO $$
+              DECLARE
+                  t TEXT;
+                  tables TEXT[] := ARRAY[
+                      'raw_event', 'rejected_event', 'event_conflict',
+                      'pricing_rule', 'rated_transaction', 'outbox_message',
+                      'invoice', 'invoice_line'
+                  ];
+              BEGIN
+                  FOREACH t IN ARRAY tables LOOP
+                      EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+                      -- FORCE makes the policy apply to the table owner too, so a
+                      -- migration-role connection cannot quietly read across tenants.
+                      EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
+                      EXECUTE format(
+                          'CREATE POLICY tenant_isolation ON %I
+                             USING (tenant_id = current_setting(''app.tenant_id'', true))
+                             WITH CHECK (tenant_id = current_setting(''app.tenant_id'', true))', t);
+                  END LOOP;
+              END $$;
+            rollback: |
+              DO $$
+              DECLARE
+                  t TEXT;
+                  tables TEXT[] := ARRAY[
+                      'raw_event', 'rejected_event', 'event_conflict',
+                      'pricing_rule', 'rated_transaction', 'outbox_message',
+                      'invoice', 'invoice_line'
+                  ];
+              BEGIN
+                  FOREACH t IN ARRAY tables LOOP
+                      EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
+                      EXECUTE format('ALTER TABLE %I DISABLE ROW LEVEL SECURITY', t);
+                  END LOOP;
+              END $$;
+
+  - changeSet:
+      id: 007-02-maintenance-bypass-role
+      author: jptoro
+      comment: >
+        Liquibase and operational jobs need to see across tenants. Rather than
+        weakening the policies, that access is an explicit, separately granted
+        role -- so cross-tenant access is always a deliberate act, not a default.
+      changes:
+        - sql:
+            splitStatements: false
+            sql: |
+              DO $$
+              BEGIN
+                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'usage_maintenance') THEN
+                      CREATE ROLE usage_maintenance NOLOGIN BYPASSRLS;
+                  END IF;
+              END $$;
+            rollback: DROP ROLE IF EXISTS usage_maintenance

@@ -1,0 +1,53 @@
+databaseChangeLog:
+
+  # ---------------------------------------------------------------------------
+  # The outbox worker's read access.
+  #
+  # A genuine tension in the design: the worker has to discover work across every
+  # tenant, but RLS is precisely what stops any connection seeing more than one
+  # tenant at a time. Three ways out, and only one of them is safe:
+  #
+  #   1. Run the worker with BYPASSRLS. Rejected: one compromised or buggy code
+  #      path in the worker then reads everything, which defeats the whole point.
+  #   2. Loop over known tenants, setting app.tenant_id for each. Rejected: it
+  #      needs a tenant registry, scales with tenant count, and starves tenants at
+  #      the end of the list under load.
+  #   3. Narrow the exemption to exactly what the claim needs. Chosen.
+  #
+  # The policy below lets a connection with app.tenant_id unset -- and ONLY unset --
+  # see outbox rows. It deliberately grants nothing on raw_event or
+  # rated_transaction, so an unscoped connection can find out that work exists but
+  # cannot read a single usage record or write a single charge.
+  #
+  # The worker therefore claims unscoped, then re-enters TenantContext.runAs() with
+  # the tenant from the claimed row before touching any financial table. Rating
+  # itself is fully tenant-scoped; only queue discovery is not.
+  # ---------------------------------------------------------------------------
+  - changeSet:
+      id: 008-01-outbox-worker-policy
+      author: jptoro
+      changes:
+        - sql:
+            splitStatements: false
+            sql: |
+              CREATE POLICY outbox_worker_claim ON outbox_message
+                  USING (current_setting('app.tenant_id', true) IS NULL)
+                  WITH CHECK (current_setting('app.tenant_id', true) IS NULL);
+            rollback: DROP POLICY IF EXISTS outbox_worker_claim ON outbox_message
+
+  - changeSet:
+      id: 008-02-raw-event-worker-read
+      author: jptoro
+      comment: >
+        The claim query joins raw_event to avoid a second round trip per message.
+        Read-only, and restricted to the unscoped worker connection in the same way.
+        Note this is a SELECT-only policy: an unscoped connection still cannot insert,
+        update or delete a usage record.
+      changes:
+        - sql:
+            splitStatements: false
+            sql: |
+              CREATE POLICY raw_event_worker_read ON raw_event
+                  FOR SELECT
+                  USING (current_setting('app.tenant_id', true) IS NULL);
+            rollback: DROP POLICY IF EXISTS raw_event_worker_read ON raw_event

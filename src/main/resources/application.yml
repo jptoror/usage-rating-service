@@ -1,0 +1,113 @@
+spring:
+  application:
+    name: usage-rating-service
+
+  lifecycle:
+    # How long shutdown waits for in-flight work before interrupting it. Declared rather
+    # than left to Spring's 30s default: this window has to exceed the worker's batch
+    # duration, or a SIGTERM during a large batch interrupts rating mid-flight. It also
+    # has to stay below the orchestrator's own kill timeout (Kubernetes defaults to 30s
+    # of terminationGracePeriodSeconds), which is why this is a fraction of it.
+    timeout-per-shutdown-phase: ${SHUTDOWN_TIMEOUT:20s}
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/usage_rating}
+    username: ${DB_USER:usage_app}
+    password: ${DB_PASSWORD:usage_app}
+    hikari:
+      # Pool sized for the web threads plus the outbox workers.
+      maximum-pool-size: ${DB_POOL_SIZE:15}
+      pool-name: usage-rating-pool
+
+  jpa:
+    open-in-view: false           # no lazy loading outside a transaction; forces explicit boundaries
+    hibernate:
+      ddl-auto: validate          # Liquibase owns the schema; Hibernate only verifies it matches
+    properties:
+      hibernate:
+        jdbc.time_zone: UTC
+        order_inserts: true
+        order_updates: true
+        jdbc.batch_size: 50
+
+  liquibase:
+    change-log: classpath:db/changelog/db.changelog-master.yaml
+    # Migrations run on their OWN connection as the owner role, which creates the
+    # extensions, tables and the runtime role itself. Setting only user/password would
+    # reuse the application DataSource, which cannot connect until `usage_app` exists --
+    # a chicken-and-egg failure at startup.
+    #
+    # The application connects as `usage_app`, which has no BYPASSRLS and owns nothing,
+    # so row-level security actually applies to it. A superuser or an owner bypasses
+    # policies unconditionally, even with FORCE ROW LEVEL SECURITY.
+    url: ${DB_MIGRATION_URL:${DB_URL:jdbc:postgresql://localhost:5432/usage_rating}}
+    user: ${DB_MIGRATION_USER:${DB_USER:usage_app}}
+    password: ${DB_MIGRATION_PASSWORD:${DB_PASSWORD:usage_app}}
+
+  jackson:
+    default-property-inclusion: non_null
+    deserialization:
+      fail-on-unknown-properties: false   # forward compatible: upstream may add fields
+
+server:
+  # On SIGTERM the worker stops claiming and finishes its current batch. Claimed work
+  # that does not finish within the window stays claimed and is reclaimed by another
+  # instance after the stale-claim timeout, so nothing is lost either way.
+  shutdown: graceful
+  error:
+    include-message: always
+    include-stacktrace: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when-authorized
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+# ---------------------------------------------------------------------------
+# Domain configuration
+# ---------------------------------------------------------------------------
+billing:
+  # Currency fallback when a pricing rule does not pin one.
+  default-currency: ${BILLING_DEFAULT_CURRENCY:USD}
+  # Monetary scale and rounding applied once, when persisting a rated amount.
+  amount-scale: 4
+  rounding-mode: HALF_UP
+  late-arrival:
+    # Events older than this that land in a closed period are quarantined
+    # rather than billed, since they usually indicate an accidental replay.
+    max-age: ${BILLING_LATE_ARRIVAL_MAX_AGE:P90D}
+
+outbox:
+  # Measured, not guessed. A 1s interval with 50-message batches caps a worker at
+  # 50 events/s regardless of how fast anything else is -- the worker spends most of
+  # its time asleep. Shortening the interval alone gained 3.9x in the load test, which
+  # is more than tripling the instances gained (1.8x). See docs/analysis/performance.md.
+  poll-interval: ${OUTBOX_POLL_INTERVAL:200ms}
+  # 200 per batch at 200ms raises the ceiling to ~1000 events/s without adding round
+  # trips per message: the claim is one query whatever the batch size.
+  batch-size: ${OUTBOX_BATCH_SIZE:200}
+  max-attempts: ${OUTBOX_MAX_ATTEMPTS:5}
+  # Exponential backoff base; attempt N waits base * 2^(N-1).
+  backoff-base: ${OUTBOX_BACKOFF_BASE:PT10S}
+  # Missing pricing rules are retried on a slower cadence, indefinitely:
+  # the rule may legitimately be created later.
+  unrated-retry-delay: ${OUTBOX_UNRATED_RETRY_DELAY:PT5M}
+
+logging:
+  level:
+    com.revenium.usage: ${LOG_LEVEL:INFO}

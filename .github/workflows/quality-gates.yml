@@ -1,0 +1,370 @@
+name: Quality gates
+
+# Runs on every pull request and on pushes to main.
+#
+# The jobs are split so a failure names what broke rather than just "the build failed":
+# a compile error, a failing unit test, a coverage shortfall and a broken migration are
+# four different problems with four different fixes.
+#
+# Ordering is deliberate — cheapest and most likely to fail first. `build` catches a
+# compile error in ~1 minute without ever starting a container.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs on a PR -- the old result is about to be stale anyway, and CI
+  # minutes are not free. Never on `main`: a run there validates a commit that is already
+  # merged, and cancelling it leaves that commit unverified.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  JAVA_VERSION: '21'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  build:
+    name: Compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # Only the default branch writes the cache, so a PR cannot poison it for
+          # everyone else.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Compile main and test sources
+        run: ./gradlew compileKotlin compileTestKotlin --no-daemon
+
+  # ---------------------------------------------------------------------------
+  unit-tests:
+    name: Unit tests and coverage gate
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      # `test` is unit tests only — integration tests are tagged and excluded — so the
+      # coverage gate measures unit coverage, as the brief requires. Letting
+      # full-context tests count would inflate it with code merely touched.
+      - name: Run unit tests
+        run: ./gradlew test --no-daemon
+
+      - name: Verify 85% line coverage
+        run: ./gradlew jacocoTestCoverageVerification --no-daemon
+
+      - name: Report coverage
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import xml.etree.ElementTree as ET, pathlib
+
+          report = pathlib.Path('build/reports/jacoco/test/jacocoTestReport.xml')
+          if not report.exists():
+              print('## Coverage\n\nNo report produced — tests did not run.')
+              raise SystemExit
+
+          root = ET.parse(report).getroot()
+          for counter in root.findall('counter'):
+              if counter.get('type') == 'LINE':
+                  missed, covered = int(counter.get('missed')), int(counter.get('covered'))
+                  pct = 100 * covered / (missed + covered)
+                  status = '✅' if pct >= 85 else '❌'
+                  print(f'## Coverage\n\n{status} **{pct:.1f}%** line coverage '
+                        f'({covered}/{missed + covered}) against an 85% gate.')
+          PY
+
+      - name: Upload test and coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            build/reports/tests/test/
+            build/reports/jacoco/test/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      # Testcontainers starts PostgreSQL itself; the Docker daemon on the runner is all
+      # it needs. Liquibase runs against that container, so the migrations are under
+      # test too — a broken changeset fails here rather than in review.
+      - name: Run integration tests
+        run: ./gradlew integrationTest --no-daemon
+
+      - name: Upload integration test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
+          path: build/reports/tests/integrationTest/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  architecture:
+    name: Architecture and invariants
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      # These would pass as part of `test`, but they are run separately and named so a
+      # violation reports as "Architecture" rather than as a generic test failure. The
+      # dependency rule was broken three times in code that compiled and passed
+      # everything else.
+      - name: Enforce the dependency rule
+        run: ./gradlew test --tests '*DependencyRuleTest*' --no-daemon
+
+      - name: Check for banned constructs
+        run: |
+          set -euo pipefail
+          failed=0
+
+          # `!!` turns a compile-time question into a runtime crash.
+          if grep -rn '!!' src/main/kotlin/ --include='*.kt' \
+               | grep -vE ':\s*(\*|//)' | grep -E '[\w)\]]!!'; then
+            echo "::error::Not-null assertion (!!) found in production code"
+            failed=1
+          fi
+
+          # 0.1 + 0.2 != 0.3 in binary floating point. An invoice off by a fraction of a
+          # cent is an invoice a reviewer finds.
+          if grep -rnE '\b(Double|Float)\b|\.toDouble\(\)' src/main/kotlin/ --include='*.kt' \
+               | grep -vE ':\s*(\*|//)'; then
+            echo "::error::Floating point found in production code"
+            failed=1
+          fi
+
+          # BigDecimal.divide without a rounding mode throws on a non-terminating result
+          # — 10/3 is enough. It is a production incident waiting for the right input.
+          if grep -rn '\.divide(' src/main/kotlin/ --include='*.kt' | grep -v 'RoundingMode'; then
+            echo "::error::BigDecimal.divide without an explicit RoundingMode"
+            failed=1
+          fi
+
+          exit $failed
+
+      # The diagrams are a deliverable, and nothing else in the build reads them. One
+      # shipped with a `;` inside a Note, which Mermaid treats as a statement separator:
+      # valid Markdown, an error box on GitHub, and invisible until someone opened the
+      # page. Parsing them with Mermaid itself is the only check that would have caught it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check the diagrams render
+        run: |
+          set -euo pipefail
+          npm install --no-save --no-fund --no-audit mermaid@11 jsdom
+          node scripts/check-diagrams.mjs
+
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image and end-to-end
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image and start the stack
+        run: |
+          cp .env.example .env
+          docker compose up -d --build
+
+      - name: Wait for the service to become healthy
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if curl -sS -m 3 http://localhost:8080/actuator/health 2>/dev/null \
+                 | grep -q '"status":"UP"'; then
+              echo "Service is healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Service did not become healthy"
+          docker compose logs app | tail -50
+          exit 1
+
+      # The scripts assert and exit non-zero, so they work unchanged in CI. They cover
+      # what the suite structurally cannot: the wire, the assembled application, and
+      # behaviour across process boundaries.
+      - name: End-to-end checks
+        run: ./scripts/e2e-test.sh
+
+      - name: Edge cases
+        run: ./scripts/edge-case-test.sh
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v
+
+  # ---------------------------------------------------------------------------
+  multi-instance:
+    name: Multi-instance coordination
+    runs-on: ubuntu-latest
+    needs: docker
+    # Only on pull requests and manual runs: it starts three instances and pushes real
+    # contention through them, which is the slowest job here. A push to main has already
+    # passed it on the PR.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start three instances
+        run: |
+          cp .env.example .env
+          # A batch smaller than the workload is what makes distribution observable.
+          # With the production default of 200 against 60 events, the first worker to
+          # wake claims everything in one pass and the other two find an empty queue --
+          # SKIP LOCKED working correctly, but with nothing left to demonstrate it.
+          # 10 forces at least six claims, so the assertion tests coordination rather
+          # than which container happened to start first.
+          echo "OUTBOX_BATCH_SIZE=10" >> .env
+          docker compose -f docker-compose.yml -f docker-compose.scale.yml \
+            up -d --build --scale app=3
+
+      - name: Wait for the load balancer
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if curl -sS -m 3 http://localhost:8080/actuator/health 2>/dev/null \
+                 | grep -q '"status":"UP"'; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Service did not become healthy"
+          docker compose logs | tail -50
+          exit 1
+
+      # Proves SKIP LOCKED coordinates across SEPARATE PROCESSES — three containers,
+      # three connection pools, three schedulers with no shared memory. The unit suite
+      # proves thread-level concurrency, which is a different claim.
+      - name: Coordination under contention
+        run: ./scripts/multi-instance-test.sh
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Stop the stack
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.scale.yml \
+            down -v --remove-orphans
+
+  # ---------------------------------------------------------------------------
+  quality-gates:
+    name: All quality gates
+    runs-on: ubuntu-latest
+    needs: [build, unit-tests, integration-tests, architecture, docker, multi-instance]
+    if: always()
+    steps:
+      # A single required status check for branch protection. Without this, adding a job
+      # means remembering to add it to the protection rules; with it, the rule is
+      # "quality-gates must pass" and stays correct.
+      #
+      # Two rules this job learned the hard way, on the run that reported success while
+      # compilation was failing:
+      #
+      # 1. `build` must be in `needs`. It was not, so its failure was invisible here.
+      # 2. A skip is only acceptable when the job was *meant* to be skipped. When
+      #    compilation failed, its five dependents skipped, and treating skip as
+      #    acceptable turned a broken build into a green required check -- the one
+      #    outcome this job exists to prevent.
+      #
+      # Only multi-instance is legitimately skippable (it is PR-only). Any other skip
+      # means something upstream did not finish, which is a failure.
+      - name: Check every gate
+        run: |
+          set -euo pipefail
+          results='${{ toJSON(needs) }}'
+          echo "$results" | python3 -c "
+          import json, sys
+
+          # PR-only by design; skipped on push to main.
+          OPTIONAL = {'multi-instance'}
+
+          needs = json.load(sys.stdin)
+
+          def ok(name, job):
+              if job['result'] == 'success':
+                  return True
+              return job['result'] == 'skipped' and name in OPTIONAL
+
+          failed = [name for name, job in needs.items() if not ok(name, job)]
+
+          for name, job in needs.items():
+              if job['result'] == 'success':
+                  mark = '✅'
+              elif job['result'] == 'skipped':
+                  mark = '⏭️' if name in OPTIONAL else '❌'
+              else:
+                  mark = '❌'
+              suffix = ' (did not run -- an upstream gate failed)' \
+                  if job['result'] == 'skipped' and name not in OPTIONAL else ''
+              print(f'{mark} {name}: {job[\"result\"]}{suffix}')
+
+          if failed:
+              print(f'\nFailed gates: {\", \".join(failed)}')
+              sys.exit(1)
+          print('\nAll quality gates passed.')
+          "

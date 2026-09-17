@@ -1,0 +1,370 @@
+package com.revenium.usage.invoicing.application
+
+import com.revenium.usage.invoicing.domain.model.Invoice
+import com.revenium.usage.invoicing.domain.model.InvoiceLine
+import com.revenium.usage.invoicing.domain.model.InvoiceStatus
+import com.revenium.usage.invoicing.domain.model.Charge
+import com.revenium.usage.invoicing.domain.port.out.ChargeLookup
+import com.revenium.usage.invoicing.domain.port.out.InvoiceStore
+import com.revenium.usage.shared.domain.BillingPeriod
+import com.revenium.usage.shared.domain.CustomerId
+import com.revenium.usage.shared.domain.Money
+import com.revenium.usage.shared.domain.Quantity
+import com.revenium.usage.shared.domain.TransactionCode
+import com.revenium.usage.tenancy.MissingTenantException
+import com.revenium.usage.tenancy.TenantContext
+import com.revenium.usage.tenancy.TenantId
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.slot
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Test
+import java.math.BigDecimal
+import java.time.Clock
+import java.time.Instant
+import java.time.ZoneOffset
+import java.util.Currency
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
+
+class InvoiceServiceTest {
+
+    private val now = Instant.parse("2026-09-16T12:00:00Z")
+    private val usd: Currency = Currency.getInstance("USD")
+    private val tenant = TenantId("tenant-a")
+    private val customer = CustomerId("customer-42")
+    private val september = BillingPeriod.parse("2026-09")
+    private val august = BillingPeriod.parse("2026-08")
+    private val july = BillingPeriod.parse("2026-07")
+
+    // A read-only port, not rating's JPA repository: invoicing has no business
+    // holding save/delete on the financial ledger.
+    private val charges = mockk<ChargeLookup>()
+    private val invoices = mockk<InvoiceStore> {
+        every { saveInvoice(any()) } answers { firstArg() }
+        every { saveLines(any()) } answers { firstArg() }
+    }
+
+    private val service = InvoiceService(
+        charges = charges,
+        invoices = invoices,
+        defaultCurrency = usd,
+        clock = Clock.fixed(now, ZoneOffset.UTC),
+    )
+
+    @AfterEach
+    fun cleanUp() = TenantContext.clear()
+
+    private fun rated(
+        code: String = "VEHICLE_REGISTRATION",
+        amount: String = "5.0000",
+        quantity: String = "2",
+        originPeriod: BillingPeriod = september,
+        isLate: Boolean = false,
+        currency: String = "USD",
+    ) = Charge(
+        transactionCode = TransactionCode(code),
+        quantity = Quantity(BigDecimal(quantity)),
+        amount = Money.of(BigDecimal(amount), Currency.getInstance(currency)),
+        originPeriod = originPeriod,
+        isLateAdjustment = isLate,
+    )
+
+    private fun noInvoiceYet() = every { invoices.findInvoice(any(), any(), any()) } returns null
+
+    private fun rating(vararg rows: Charge) =
+        every { charges.findChargesFor(any(), any(), any()) } returns rows.toList()
+
+    private fun closedInvoice(period: BillingPeriod, amount: String, count: Long = 40) = Invoice(
+        tenantId = tenant, customerId = customer, period = period,
+        status = InvoiceStatus.CLOSED, currency = usd,
+        currentPeriodAmount = Money.of(BigDecimal(amount), usd),
+        adjustmentAmount = Money.zero(usd),
+        totalAmount = Money.of(BigDecimal(amount), usd),
+        transactionCount = count, closedAt = now, id = 1L,
+    )
+
+    private fun closedLine(period: BillingPeriod, amount: String, quantity: String, count: Long) =
+        InvoiceLine(
+            tenantId = tenant, invoiceId = 1L,
+            transactionCode = TransactionCode("VEHICLE_REGISTRATION"),
+            transactionCount = count, totalQuantity = Quantity(BigDecimal(quantity)),
+            amount = Money.of(BigDecimal(amount), usd), originPeriod = period,
+        )
+
+    // --- summarising an open period ----------------------------------------
+
+    @Test
+    fun `aggregates rated transactions by code`() {
+        noInvoiceYet()
+        rating(rated(), rated(), rated(code = "TITLE_TRANSFER", amount = "7.2500", quantity = "1"))
+
+        val summary = TenantContext.runAs(tenant) { service.summarise(customer, september) }
+
+        assertEquals(2, summary.lines.size)
+        assertEquals("17.2500", summary.totalAmount.amount.toPlainString())
+        assertEquals(3, summary.transactionCount)
+    }
+
+    @Test
+    fun `sums already-rounded amounts rather than recalculating`() {
+        // Recalculating from quantity x price would round the aggregate differently and
+        // produce a total that no longer matches its own lines.
+        noInvoiceYet()
+        rating(
+            rated(code = "RECORD_LOOKUP", amount = "0.0233", quantity = "7"),
+            rated(code = "RECORD_LOOKUP", amount = "0.0233", quantity = "7"),
+            rated(code = "RECORD_LOOKUP", amount = "0.0233", quantity = "7"),
+        )
+
+        val summary = TenantContext.runAs(tenant) { service.summarise(customer, september) }
+
+        assertEquals("0.0699", summary.totalAmount.amount.toPlainString())
+    }
+
+    @Test
+    fun `separates adjustments from this period's usage`() {
+        noInvoiceYet()
+        rating(
+            rated(amount = "100.0000"),
+            rated(amount = "25.0000", originPeriod = august, isLate = true),
+        )
+
+        val summary = TenantContext.runAs(tenant) { service.summarise(customer, september) }
+
+        assertEquals("100.0000", summary.currentPeriodAmount.amount.toPlainString())
+        assertEquals("25.0000", summary.adjustmentAmount.amount.toPlainString())
+        assertEquals("125.0000", summary.totalAmount.amount.toPlainString())
+    }
+
+    @Test
+    fun `an empty period totals zero in the default currency`() {
+        // No transactions means no currency to infer, and the period must still be
+        // reportable rather than failing.
+        noInvoiceYet()
+        rating()
+
+        val summary = TenantContext.runAs(tenant) { service.summarise(customer, september) }
+
+        assertTrue(summary.totalAmount.isZero())
+        assertEquals(usd, summary.currency)
+    }
+
+    @Test
+    fun `takes the currency from the transactions themselves`() {
+        noInvoiceYet()
+        rating(rated(code = "CODE", amount = "7.5000", currency = "EUR"))
+
+        val summary = TenantContext.runAs(tenant) { service.summarise(customer, september) }
+
+        assertEquals("EUR", summary.currency.currencyCode)
+    }
+
+    // --- summarising a closed period ---------------------------------------
+
+    @Test
+    fun `reads a closed invoice back rather than re-aggregating it`() {
+        // Re-aggregating could report a different figure than the one already billed,
+        // which is precisely what closing exists to prevent.
+        val closed = Invoice(
+            tenantId = tenant, customerId = customer, period = september,
+            status = InvoiceStatus.CLOSED, currency = usd,
+            currentPeriodAmount = Money.of(BigDecimal("100.0000"), usd),
+            adjustmentAmount = Money.of(BigDecimal("25.0000"), usd),
+            totalAmount = Money.of(BigDecimal("125.0000"), usd),
+            transactionCount = 7, closedAt = now, id = 1L,
+        )
+        every { invoices.findInvoice(any(), any(), any()) } returns closed
+        every { invoices.findLines(closed) } returns listOf(
+            InvoiceLine(
+                tenantId = tenant, invoiceId = 1L,
+                transactionCode = TransactionCode("VEHICLE_REGISTRATION"),
+                transactionCount = 7, totalQuantity = Quantity(BigDecimal("14")),
+                amount = Money.of(BigDecimal("125.0000"), usd), originPeriod = september,
+            )
+        )
+
+        val summary = TenantContext.runAs(tenant) { service.summarise(customer, september) }
+
+        assertEquals(InvoiceStatus.CLOSED, summary.status)
+        assertEquals("125.0000", summary.totalAmount.amount.toPlainString())
+        assertEquals(7, summary.transactionCount)
+    }
+
+    // --- closing -----------------------------------------------------------
+
+    @Test
+    fun `closing freezes the aggregate onto the invoice`() {
+        noInvoiceYet()
+        rating(rated(amount = "100.0000"), rated(amount = "25.0000", originPeriod = august, isLate = true))
+
+        val persisted = slot<Invoice>()
+        every { invoices.saveInvoice(capture(persisted)) } answers { firstArg() }
+
+        val summary = TenantContext.runAs(tenant) { service.closePeriod(customer, september) }
+
+        assertEquals(InvoiceStatus.CLOSED, summary.status)
+        assertEquals(InvoiceStatus.CLOSED, persisted.captured.status)
+        assertEquals("125.0000", persisted.captured.totalAmount.amount.toPlainString())
+        assertEquals(now, persisted.captured.closedAt)
+    }
+
+    @Test
+    fun `closing writes one line per code and origin period`() {
+        // This period's consumption and an adjustment from August are separate lines:
+        // merging them would give a correct total nobody could explain.
+        noInvoiceYet()
+        rating(rated(amount = "100.0000"), rated(amount = "25.0000", originPeriod = august, isLate = true))
+
+        val lines = slot<List<InvoiceLine>>()
+        every { invoices.saveLines(capture(lines)) } answers { firstArg() }
+
+        TenantContext.runAs(tenant) { service.closePeriod(customer, september) }
+
+        assertEquals(2, lines.captured.size)
+        assertNotNull(lines.captured.firstOrNull { it.isAdjustment })
+        assertEquals(august, lines.captured.first { it.isAdjustment }.originPeriod)
+    }
+
+    @Test
+    fun `refuses to close an already closed period`() {
+        every { invoices.findInvoice(any(), any(), any()) } returns
+            Invoice(
+                tenantId = tenant, customerId = customer, period = september,
+                status = InvoiceStatus.CLOSED, currency = usd, closedAt = now, id = 1L,
+            )
+
+        assertFailsWith<IllegalStateException> {
+            TenantContext.runAs(tenant) { service.closePeriod(customer, september) }
+        }
+    }
+
+    @Test
+    fun `closes an empty period at zero`() {
+        noInvoiceYet()
+        rating()
+
+        val summary = TenantContext.runAs(tenant) { service.closePeriod(customer, september) }
+
+        assertTrue(summary.totalAmount.isZero())
+        assertEquals(InvoiceStatus.CLOSED, summary.status)
+    }
+
+    // --- tenancy -----------------------------------------------------------
+
+    @Test
+    fun `refuses to summarise with no tenant in scope`() {
+        assertFailsWith<MissingTenantException> { service.summarise(customer, september) }
+    }
+
+    @Test
+    fun `scopes the query to the tenant in scope`() {
+        noInvoiceYet()
+        val queriedTenant = slot<TenantId>()
+        every { charges.findChargesFor(capture(queriedTenant), any(), any()) } returns emptyList()
+
+        TenantContext.runAs(TenantId("tenant-b")) { service.summarise(customer, september) }
+
+        assertEquals("tenant-b", queriedTenant.captured.value)
+    }
+
+    // --- summarising a range of periods ------------------------------------
+
+    @Test
+    fun `totals usage across every period in the range`() {
+        noInvoiceYet()
+        // Each period contributes the same two charges.
+        rating(rated(), rated(code = "TITLE_TRANSFER", amount = "7.2500", quantity = "1"))
+
+        val summary = TenantContext.runAs(tenant) {
+            service.summariseRange(customer, july, september)
+        }
+
+        assertEquals(3, summary.periods.size)
+        assertEquals(listOf("2026-07", "2026-08", "2026-09"), summary.periods.map { it.period.toString() })
+
+        // Codes are totalled across the whole span, not repeated per period.
+        assertEquals(2, summary.lines.size)
+        // 5.0000 + 7.2500 per period, three periods.
+        assertEquals("36.7500", summary.totalAmount.amount.toPlainString())
+        // Two transactions per period, not two lines: the line count is the number of
+        // distinct codes, which is what collapsing across periods produces.
+        assertEquals(6, summary.transactionCount)
+    }
+
+    @Test
+    fun `a closed period contributes the figures it was billed at`() {
+        // The reason the range is built period by period rather than with one wide query:
+        // re-aggregating a closed month could report a different number than the invoice
+        // already sent.
+        every { invoices.findInvoice(any(), any(), august) } returns closedInvoice(august, "99.0000")
+        every { invoices.findInvoice(any(), any(), september) } returns null
+        every { invoices.findLines(any()) } returns listOf(
+            closedLine(august, amount = "99.0000", quantity = "40", count = 40),
+        )
+        every { charges.findChargesFor(any(), any(), september) } returns listOf(rated())
+
+        val summary = TenantContext.runAs(tenant) {
+            service.summariseRange(customer, august, september)
+        }
+
+        // 99.0000 frozen + 5.0000 still open. Not a re-derivation of either.
+        assertEquals("104.0000", summary.totalAmount.amount.toPlainString())
+        assertEquals(
+            listOf(InvoiceStatus.CLOSED, InvoiceStatus.OPEN),
+            summary.periods.map { it.status },
+        )
+    }
+
+    @Test
+    fun `a single-period range is the period itself`() {
+        noInvoiceYet()
+        rating(rated())
+
+        val summary = TenantContext.runAs(tenant) {
+            service.summariseRange(customer, september, september)
+        }
+
+        assertEquals(1, summary.periods.size)
+        assertEquals("5.0000", summary.totalAmount.amount.toPlainString())
+    }
+
+    @Test
+    fun `a range with no usage totals zero`() {
+        noInvoiceYet()
+        rating()
+
+        val summary = TenantContext.runAs(tenant) {
+            service.summariseRange(customer, july, september)
+        }
+
+        assertTrue(summary.lines.isEmpty())
+        assertTrue(summary.totalAmount.isZero())
+        assertEquals(3, summary.periods.size)
+    }
+
+    @Test
+    fun `a backwards range is refused`() {
+        assertFailsWith<IllegalArgumentException> {
+            TenantContext.runAs(tenant) { service.summariseRange(customer, september, july) }
+        }
+    }
+
+    @Test
+    fun `a range longer than the bound is refused`() {
+        // Bounded because the cost is linear in the span: this is a reporting question,
+        // and anything wider is a data export.
+        assertFailsWith<IllegalArgumentException> {
+            TenantContext.runAs(tenant) {
+                service.summariseRange(customer, july, BillingPeriod.parse("2029-07"))
+            }
+        }
+    }
+
+    @Test
+    fun `a range requires a tenant in scope`() {
+        assertFailsWith<MissingTenantException> { service.summariseRange(customer, july, september) }
+    }
+}

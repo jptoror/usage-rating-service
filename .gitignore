@@ -7,7 +7,12 @@ build/
 .idea/
 *.iml
 .vscode/
-out/
+*.iws
+*.ipr
+# Anchored: IntelliJ's build directory is at the repo root. Unanchored, this also
+# matched src/**/domain/port/out/ and silently excluded every outbound port -- the
+# build passed locally, where the files exist, and failed on a fresh clone in CI.
+/out/
 
 # OS
 .DS_Store
