@@ -19,7 +19,7 @@ sequenceDiagram
 
     C->>F: POST /transactions<br/>X-Tenant-Id: tenant-a
     F->>F: TenantContext.set(tenant-a)
-    Note over F: header is the only source of identity;<br/>a tenantId in the body is data to check
+    Note over F: header is the only source of identity —<br/>a tenantId in the body is data to check
 
     F->>A: ingest(input)
     A->>A: tenant in scope?

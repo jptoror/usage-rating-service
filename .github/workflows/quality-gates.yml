@@ -195,6 +195,20 @@ jobs:
 
           exit $failed
 
+      # The diagrams are a deliverable, and nothing else in the build reads them. One
+      # shipped with a `;` inside a Note, which Mermaid treats as a statement separator:
+      # valid Markdown, an error box on GitHub, and invisible until someone opened the
+      # page. Parsing them with Mermaid itself is the only check that would have caught it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check the diagrams render
+        run: |
+          set -euo pipefail
+          npm install --no-save --no-fund --no-audit mermaid@11 jsdom
+          node scripts/check-diagrams.mjs
+
   # ---------------------------------------------------------------------------
   docker:
     name: Docker image and end-to-end
