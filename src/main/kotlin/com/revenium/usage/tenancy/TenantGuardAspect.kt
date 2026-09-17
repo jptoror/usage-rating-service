@@ -21,8 +21,10 @@ private val log = KotlinLogging.logger {}
  * still be correct, but burning a connection per rejected call is a free denial-of-service vector.
  *
  * Self-invocation bypasses the proxy and this advice, and is not papered over with
- * `AopContext.currentProxy()`: annotated methods are genuine entry points, and
- * `TenantGuardAspectTest` proves row-level security still blocks the data when it is skipped.
+ * `AopContext.currentProxy()`: annotated methods are genuine entry points, and the aspect is
+ * the first line of defence rather than the isolation mechanism. `OutboxWorkerIntegrationTest`
+ * ("rated transactions are invisible to other tenants") shows row-level security still
+ * returning nothing when the aspect is out of the picture.
  * Likewise the [ThreadLocal] does not cross a thread pool — the outbox worker and
  * `TenantAwareTaskDecorator` re-establish the scope explicitly, never implicitly.
  */

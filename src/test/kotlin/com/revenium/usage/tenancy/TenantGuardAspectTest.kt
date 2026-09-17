@@ -105,9 +105,11 @@ class TenantGuardAspectTest {
         // target object, so no proxy and no advice. This is a real Spring AOP
         // limitation, proven here rather than assumed away.
         //
-        // It is also why the aspect is not the isolation mechanism: row-level
-        // security still returns nothing for this call, which
-        // TenantIsolationIntegrationTest demonstrates against a real database.
+        // It is also why the aspect is not the isolation mechanism: row-level security
+        // still returns nothing for such a call. This test uses no database, so the
+        // proof lives in IngestionIntegrationTest ("one tenant cannot read another's
+        // events") and OutboxWorkerIntegrationTest ("rated transactions are invisible
+        // to other tenants").
         assertEquals("guarded", service.viaSelfInvocation())
     }
 }

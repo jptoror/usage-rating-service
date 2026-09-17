@@ -41,7 +41,7 @@ Java 21 is required: `export JAVA_HOME=$(/usr/libexec/java_home -v 21)`
 | | |
 | --- | --- |
 | Unit tests | 301 |
-| Integration tests | 41 (Testcontainers) |
+| Integration tests | 44 (Testcontainers) |
 | Line coverage | **91.17%** against an 85% gate |
 | Scripted checks | 22 end-to-end + 22 edge cases + 8 multi-instance |
 | Measured throughput | ~330 events/s ingested, 228 events/s rated on **one** tuned instance |
@@ -263,6 +263,29 @@ A broker was considered and rejected: publishing to Kafka and writing to Postgre
 atomic, so a correct implementation needs an outbox table *anyway*. Adding the broker would
 add a container and several failure modes without adding correctness at this scale.
 
+**Why not `@TransactionalEventListener(AFTER_COMMIT)`?** It solves the ordering problem —
+the listener runs only once the transaction has committed, so it never observes a row that
+is later rolled back, which is exactly the failure mode `@Async` inside a transactional
+method runs into. That much it shares with the outbox. What it does not survive is a
+crash:
+
+| | `AFTER_COMMIT` | Outbox |
+| --- | --- | --- |
+| Work is | in memory, in this JVM | a committed row |
+| JVM dies after commit, before the work runs | **silently lost** — nothing records that it was owed | claimed again after the stale-claim timeout |
+| Second instance | cannot see the work | claims it with `SKIP LOCKED` |
+| Retry / dead-letter | hand-rolled per listener | `attempt_count`, backoff, `FAILED` |
+| Visible to an operator | no | `SELECT … FROM outbox_message` |
+
+For a notification the loss would be a nuisance. Here the lost work is *rating a
+transaction that has already been accepted and acknowledged with `202`* — the money is
+simply never billed, and no query would reveal it, because the only evidence the work was
+owed died with the process. That is the invariant this service exists to hold, so the work
+has to be as durable as the event that created it.
+
+`AFTER_COMMIT` remains the right tool where losing the work is acceptable: cache
+invalidation, a metric, an email that can be re-sent.
+
 **Guarantees and limits**, explicitly:
 
 - **At-least-once, never exactly-once.** A worker that dies mid-transaction releases its
@@ -461,12 +484,46 @@ Integration tests are tagged `integration` and excluded from `./gradlew test`, s
 **coverage gate measures unit-test coverage only** — a full-context test would otherwise
 inflate it with code that was merely touched rather than verified.
 
+### Two standard annotations this project does not use
+
+Both are the obvious choice here, and both were tried. Each would have made a test pass
+while proving less than it appears to.
+
+**`@ServiceConnection`** wires the application to the Testcontainers container's
+**superuser** — and a superuser bypasses row-level security unconditionally, even under
+`FORCE ROW LEVEL SECURITY`. Every tenant-isolation test would have passed without the
+policies doing anything. This is not hypothetical: the first run of this suite leaked
+tenant-a's rows into a tenant-b query, and the cause was the connecting role, not the
+policies.
+
+So the roles mirror production instead. Liquibase connects as the owner, because it
+creates extensions and tables; the application connects as `usage_app`, which owns
+nothing and has `NOBYPASSRLS`, so the policies apply to it exactly as they do in
+production. The wiring is a small `ApplicationContextInitializer`
+(`support/IntegrationTest.kt`) — `@DynamicPropertySource` is also unusable here, because
+it is only honoured on the test class itself and is silently ignored on an `@Import`ed
+`@TestConfiguration`.
+
+**`@DataJpaTest`** replaces the datasource and rolls each test back by default. Neither
+fits what the persistence layer here actually needs proving: the constraints are the
+enforcement mechanism (`EXCLUDE USING gist`, the partial unique index, RLS policies), and
+they only exist in a real PostgreSQL with the right role connected. A slice against an
+embedded database would test Hibernate's mapping, which is not where the risk is.
+
+The mapping is still covered without Spring at all: each entity has round-trip unit tests
+(`*/infrastructure/persistence/*EntityTest.kt`) asserting that domain → entity → domain
+loses nothing. Those run in the unit suite and count toward the coverage gate; the
+constraint behaviour runs against Testcontainers.
+
 The four behaviours the brief names explicitly:
 
 - **AOP applies** — and self-invocation demonstrably bypasses it, with RLS still blocking
   the data.
-- **Rollback** — a failure leaves no event behind, while the `REQUIRES_NEW` rejection record
-  survives.
+- **Rollback** — an accepted event and its outbox row survive a failure in the caller,
+  because every ingestion write is `REQUIRES_NEW`: once the upstream has been told `202`
+  it will not re-deliver, so un-accepting the event would lose it. The rejection record
+  survives the same way, and a duplicate's failed insert rolls back without disturbing
+  the original.
 - **Idempotency** — ten concurrent threads on one event id; four concurrent workers on
   twenty events; exactly one charge each time.
 - **Tenant isolation** — at the aspect, at the repository, and at the database, including a

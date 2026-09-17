@@ -17,12 +17,14 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.transaction.support.TransactionTemplate
 import java.math.BigDecimal
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -39,6 +41,7 @@ class IngestionIntegrationTest(
     @Autowired val conflicts: EventConflictJpaRepository,
     @Autowired val rejectedEvents: RejectedEventJpaRepository,
     @Autowired val jdbc: JdbcTemplate,
+    @Autowired val transactions: TransactionTemplate,
 ) {
 
     private val tenantA = TenantId("tenant-a")
@@ -239,6 +242,78 @@ class IngestionIntegrationTest(
     }
 
     // --- helpers -----------------------------------------------------------
+
+    // --- rollback ----------------------------------------------------------
+    //
+    // The transaction boundaries are the reason ingestion is split across three beans,
+    // and until these tests existed the README asserted a rollback behaviour that
+    // nothing verified. Both cases drive a real transaction against a real database:
+    // a mocked store would prove the test doubles roll back, which is not the claim.
+
+    @Test
+    fun `an accepted event survives the caller's rollback`() {
+        // The point of REQUIRES_NEW on every ingestion write: once the database has
+        // accepted an event, a later failure in the caller must not un-accept it. The
+        // upstream integration has been told 202 and will not re-deliver.
+        //
+        // Writing this test the other way round -- asserting the event disappears --
+        // is what exposed the README's claim that "a failure leaves no event behind".
+        // That describes the opposite of what the boundaries are built to do.
+        val eventId = UUID.randomUUID()
+
+        TenantContext.runAs(tenantA) {
+            assertFailsWith<IllegalStateException> {
+                transactions.executeWithoutResult {
+                    assertIs<IngestionResult.Accepted>(ingestionService.ingest(input(eventId)))
+                    throw IllegalStateException("failing deliberately, after the write")
+                }
+            }
+
+            assertEquals(1, countRawEvents(tenantA))
+            // And its unit of work with it. An event that survived without its outbox
+            // row would be accepted evidence that never becomes a charge.
+            assertEquals(1, countOutboxMessages(tenantA))
+        }
+    }
+
+    @Test
+    fun `a rejection recorded in its own transaction survives the caller's rollback`() {
+        // Why RejectionRecorder is REQUIRES_NEW: the evidence has to outlive the attempt
+        // it is evidence of. Rolling the rejection back with the request would discard
+        // the only record that anything arrived at all.
+        TenantContext.runAs(tenantA) {
+            assertFailsWith<IllegalStateException> {
+                transactions.executeWithoutResult {
+                    assertIs<IngestionResult.Rejected>(ingestionService.ingest(input().copy(customerId = null)))
+                    throw IllegalStateException("rolling back the caller")
+                }
+            }
+
+            assertEquals(1, rejectedEvents.countByTenantId(tenantA.value))
+            assertEquals(0, countRawEvents(tenantA))
+        }
+    }
+
+    @Test
+    fun `a duplicate rolls back its own attempt without disturbing the original`() {
+        // Atomicity WITHIN the boundary. The duplicate insert fails on the unique
+        // constraint, which marks that transaction rollback-only -- and it is precisely
+        // because the failing insert has its own transaction that the first delivery's
+        // event and outbox row are untouched by it.
+        val eventId = UUID.randomUUID()
+
+        TenantContext.runAs(tenantA) {
+            assertIs<IngestionResult.Accepted>(ingestionService.ingest(input(eventId)))
+
+            // The second delivery's insert fails inside EventRecorder and is resolved by
+            // DuplicateResolver on a clean transaction and a clean session.
+            assertIs<IngestionResult.Duplicate>(ingestionService.ingest(input(eventId)))
+
+            // One event, one unit of work: the rolled-back attempt added neither.
+            assertEquals(1, countRawEvents(tenantA))
+            assertEquals(1, countOutboxMessages(tenantA))
+        }
+    }
 
     private fun countRawEvents(tenant: TenantId): Long =
         TenantContext.runAs(tenant) { rawEvents.count() }
