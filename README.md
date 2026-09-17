@@ -508,12 +508,23 @@ Simplified, as the brief permits:
   volume discounts — the model leaves room for them without a destructive migration.
   Pricing is read-only over the API; price changes are an administrative operation.
 - **Currency.** One currency per pricing rule, no FX conversion.
-- **JPA annotations on domain entities.** A pragmatic exception to keeping the domain
-  framework-free: a parallel set of persistence classes plus mappers would cost more than it
-  buys at this size.
-
 Not sacrificed: no double billing, every amount explainable, no cross-tenant access,
 append-only history, decimal arithmetic with explicit rounding.
+
+### Paid for, not simplified away
+
+**The persistence layer is separate from the domain.** Each module's `domain/model` is
+plain Kotlin over the typed values (`Money`, `Quantity`, `BillingPeriod`); the `@Entity`
+mirroring the table lives in `infrastructure/persistence` behind an out-port, with a
+`toDomain()`/`fromDomain()` pair.
+
+The mapping is boilerplate and the cost is real. It buys a domain that unit-tests with
+no Spring context and cannot be quietly reshaped by a mapping concern. Eight models now
+reject their own invalid states in `init` — an invoice whose total is not
+`currentPeriod + adjustment`, a late adjustment billed in its own origin period, a
+conflict whose two payload hashes are equal. Every
+mapper is covered by a round-trip test: one that silently drops a field would otherwise
+surface only in an audit, with the amount written under the wrong period.
 
 ### Open questions
 

@@ -73,10 +73,17 @@ com.revenium.usage
 
 Each domain module is sliced the same way:
 
-- `domain` — entities, value objects, domain services, repository *interfaces*.
-  No Spring annotations beyond JPA mapping. No knowledge of HTTP or of other modules.
+- `domain/model` — entities and value objects as plain Kotlin, using the typed values
+  (`Money`, `Quantity`, `BillingPeriod`, …). **No framework annotations at all, JPA
+  included.** No knowledge of HTTP or of other modules.
+- `domain/port/in` — an inbound port per use case, implemented by the `@Service`.
+- `domain/port/out` — outbound ports, exposing only the operations the module performs.
+  Never a full `JpaRepository`: a read-only consumer does not get `save` and `deleteAll`.
 - `application` — use-case orchestration, transaction boundaries, `@Service`.
-- `infrastructure` — repository implementations, JDBC, adapters to the outside.
+- `infrastructure/persistence` — the `@Entity` mirroring the table with primitives, plus
+  `toDomain()` and a `fromDomain()` in its companion, and the adapter implementing the
+  outbound port. The entity never escapes this package.
+- `infrastructure` — other adapters to the outside: JDBC projections, queue adapters.
 - `api` — controllers and DTOs. Present only where the module is exposed over HTTP.
 
 **Dependency rule: `api` → `application` → `domain`, and `infrastructure` → `domain`.

@@ -31,61 +31,94 @@ violate them even with a bug in the application layer.
 
 ---
 
-## Modules and dependencies
+## How a module is sliced
+
+Every module has the same four layers. The dependency rule is the whole of the
+architecture: **arrows point inward, and `domain` points at nothing.**
 
 ```mermaid
-flowchart TD
-  subgraph edge["Edge"]
+flowchart LR
+  subgraph mod["One module"]
+    direction LR
     API["api<br/>controllers, DTOs"]
+    APP["application<br/>@Service, @Transactional"]
+    subgraph dom["domain — no framework, not even JPA"]
+      direction TB
+      PIN["port/in<br/>use case interfaces"]
+      MODEL["model<br/>entities, value objects"]
+      POUT["port/out<br/>what the module needs"]
+    end
+    INFRA["infrastructure/persistence<br/>@Entity + adapter"]
   end
 
-  subgraph app["Use cases"]
-    ING["ingestion"]
-    RAT["rating"]
-    INV["invoicing"]
-    REC["reconciliation"]
-    PROC["processing<br/>outbox worker"]
-  end
-
-  subgraph dom["Domain — depends on nothing"]
-    MONEY["shared<br/>Money, BillingPeriod, ids"]
-    PRICE["pricing<br/>PricingRule"]
-    TEN["tenancy<br/>TenantContext, aspect"]
-  end
-
-  INFRA["infrastructure<br/>JPA, JDBC, RLS plumbing"]
-
-  API --> ING & INV & REC
-  PROC --> RAT
-  ING & RAT & INV & REC --> MONEY
-  RAT --> PRICE
-  ING & RAT & INV & REC --> TEN
-  INFRA --> MONEY & PRICE
+  API --> PIN
+  APP -. implements .-> PIN
+  APP --> MODEL & POUT
+  INFRA -. implements .-> POUT
+  INFRA --> MODEL
 
   style dom fill:#e6f4ea,stroke:#34a853
   style INFRA fill:#fef7e0,stroke:#fbbc04
+  style API fill:#fef7e0,stroke:#fbbc04
 ```
 
-Arrows point inward. `domain` imports nothing from `api`, `application`,
-`infrastructure`, or another module's internals — which is what lets the rating rules,
-monetary arithmetic and period boundaries be unit-tested with no Spring context and no
-database.
+The two yellow boxes are the replaceable edges; the green one holds the rules. That is
+what lets rating, monetary arithmetic and period boundaries be unit-tested with no
+Spring context and no database.
+
+**The `@Entity` never leaves `infrastructure/persistence`.** It mirrors the *table* —
+primitives, nullable columns, no invariants — and converts through `toDomain()` and a
+`fromDomain()` in its companion. The domain model holds the typed values (`Money`,
+`BillingPeriod`, `Quantity`) and enforces its invariants in `init`. The two shapes are
+allowed to disagree, which is the point: `rated_transaction.currency` is a `CHAR(3)`
+column and a `java.util.Currency` in the domain.
+
+One consequence worth naming: a pure domain model cannot be a mutable JPA entity, so
+`Invoice.close()` and `OutboxMessage.mark*()` return a new instance instead of mutating
+in place. State transitions became values rather than side effects.
+
+Round-trip unit tests cover every mapper. A mapper that silently drops a field is a real
+failure mode — the amount would still be written, just under the wrong period.
+
+---
+
+## Modules and ports
 
 Cross-module calls go through a port owned by the **consuming** module — the module
-states what it needs, and the providing module supplies it:
+states what it needs, and the providing module supplies it. Never a full
+`JpaRepository`: a read-only consumer does not get `save` and `deleteAll`.
 
-| Port | Owned by | Implemented by | What it prevents |
+| Out-port | Owned by | Implemented by | What it prevents |
 | --- | --- | --- | --- |
-| `PricingRuleLookup` | `pricing.domain` | `pricing.infrastructure` | rating depending on JPA |
-| `BillingPeriodStatusLookup` | `invoicing.domain` | `invoicing.infrastructure` | rating importing invoicing internals |
-| `ChargeLookup` | `invoicing.domain` | `rating.infrastructure` | invoicing holding `save`/`delete` on the ledger |
-| `RatingQueue` | `ingestion.domain` | `processing.infrastructure` | ingestion holding `delete` on the work queue |
-| `RateableTransaction` | `rating.domain` | mapped by `processing` | rating being drivable only by the outbox |
+| `PricingRuleLookup` | `pricing` | `pricing.infrastructure.persistence` | rating depending on JPA |
+| `BillingPeriodStatusLookup` | `invoicing` | `invoicing.infrastructure.persistence` | rating importing invoicing internals |
+| `ChargeLookup` | `invoicing` | `rating.infrastructure.persistence` | invoicing holding `save`/`delete` on the ledger |
+| `RatingQueue` | `ingestion` | `processing.infrastructure` | ingestion holding `delete` on the work queue |
+| `EventStore` | `ingestion` | `ingestion.infrastructure.persistence` | the raw-event entity escaping its package |
+| `RatedTransactionStore` | `rating` | `rating.infrastructure.persistence` | the same, for the ledger |
+| `InvoiceStore` | `invoicing` | `invoicing.infrastructure.persistence` | the same, for invoices |
+| `OutboxMessageStore` | `processing` | `processing.infrastructure.persistence` | the same, for the queue |
 
-Each of the last three replaced a direct dependency on another module's infrastructure.
-Two of them also removed **write access** a module had no business holding: invoicing
-could have deleted rated transactions, and ingestion could have emptied the outbox.
-`DependencyRuleTest` now fails the build if any of these regress.
+Four of these removed **write access** a module had no business holding: invoicing could
+have deleted rated transactions, ingestion could have emptied the outbox. The in-ports
+(`IngestTransactionUseCase`, `RateTransactionUseCase`, `SummariseInvoiceUseCase`,
+`ClosePeriodUseCase`, `DrainOutboxUseCase`, `ReconcileUseCase`) let controllers and the
+scheduler depend on a named use case rather than on a concrete `@Service`.
+
+`DependencyRuleTest` fails the build if any of this regresses, including on a stray
+`jakarta.persistence` import under any `domain` package.
+
+### Two places that stayed raw JDBC, deliberately
+
+`OutboxClaimRepository` and `ReconciliationService` are not behind entity-based ports.
+
+For the claim, `FOR UPDATE SKIP LOCKED` over a two-table join returning a projection
+*is* the mechanism — routing it through a port would obscure the one line that matters.
+For reconciliation, the queries span `raw_event`, `rejected_event`, `outbox_message`,
+`rated_transaction` and `invoice` across five modules; modelling that as ports would
+mean five round trips per report and would hide the very arithmetic the report exists to
+make checkable. `ReconciliationService` does sit behind `ReconcileUseCase`, so its
+callers still depend on an interface.
 
 ---
 
