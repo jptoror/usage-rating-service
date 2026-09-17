@@ -58,9 +58,16 @@ if [ "$INSTANCES" -lt 2 ]; then
     exit 1
 fi
 
+# Read from the running container rather than assuming the default: an environment
+# variable overrides application.yml, so the value in the source tree can differ from
+# the one actually in force. A load measurement was once misread for exactly that reason.
+BATCH_SIZE=$(docker compose exec -T app printenv OUTBOX_BATCH_SIZE 2>/dev/null | tr -d '\r' || true)
+[ -z "$BATCH_SIZE" ] && BATCH_SIZE=200
+
 section "Setup"
 info "Instances:   $INSTANCES"
 info "Events:      $EVENTS"
+info "Batch size:  $BATCH_SIZE $([ "$BATCH_SIZE" -ge "$EVENTS" ] && echo '(>= workload: one worker can claim it all)')"
 info "Concurrency: $CONCURRENCY parallel senders"
 info "Customer:    $CUSTOMER"
 
@@ -159,6 +166,14 @@ printf '%s\n' "$DISTRIBUTION" | while read -r line; do [ -n "$line" ] && info "$
 
 if [ "$INSTANCES_USED" -ge 2 ]; then
     pass "work was claimed by $INSTANCES_USED distinct instances"
+elif [ "$BATCH_SIZE" -ge "$EVENTS" ]; then
+    # Distinguish a coordination failure from a test that could not observe one. With a
+    # batch at least as large as the workload, the first worker to wake legitimately
+    # takes everything and the others find an empty queue. That is SKIP LOCKED working;
+    # there is simply nothing left for it to demonstrate.
+    fail "only $INSTANCES_USED instance claimed work, but the batch size ($BATCH_SIZE) \
+is >= the workload ($EVENTS), so one worker can take it all. Re-run with a smaller \
+batch to observe distribution: OUTBOX_BATCH_SIZE=10 ./scripts/start.sh --scale 3"
 else
     fail "only $INSTANCES_USED instance claimed work — SKIP LOCKED is not distributing"
 fi

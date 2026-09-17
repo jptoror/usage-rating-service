@@ -257,6 +257,13 @@ jobs:
       - name: Start three instances
         run: |
           cp .env.example .env
+          # A batch smaller than the workload is what makes distribution observable.
+          # With the production default of 200 against 60 events, the first worker to
+          # wake claims everything in one pass and the other two find an empty queue --
+          # SKIP LOCKED working correctly, but with nothing left to demonstrate it.
+          # 10 forces at least six claims, so the assertion tests coordination rather
+          # than which container happened to start first.
+          echo "OUTBOX_BATCH_SIZE=10" >> .env
           docker compose -f docker-compose.yml -f docker-compose.scale.yml \
             up -d --build --scale app=3
 
